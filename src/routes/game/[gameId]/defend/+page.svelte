@@ -40,15 +40,21 @@
 
     teamId = member.team_id;
 
-    const [{ data: challengeRows }, { data: defendedRows }] = await Promise.all([
-      supabase.from('challenges').select('id, model_name, description, type, defense_reward_coins, attack_steal_coins').order('created_at', { ascending: true }),
+    const [{ data: gameChallengeRows }, { data: defendedRows }] = await Promise.all([
+      supabase
+        .from('game_challenges')
+        .select('challenge_id, challenges!inner(id, model_name, description, type, defense_reward_coins, attack_steal_coins, created_at)')
+        .eq('game_id', gameId),
       supabase
         .from('defended_challenges')
         .select('id, challenge_id, system_prompt, is_active, created_at')
         .eq('team_id', teamId)
     ]);
 
-    challenges = challengeRows ?? [];
+    challenges = (gameChallengeRows ?? [])
+      .map((row: any) => row.challenges)
+      .filter((row: any) => !!row)
+      .sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
     defended = defendedRows ?? [];
 
     loading = false;

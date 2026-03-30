@@ -2,33 +2,87 @@
 import './layout.css';
 import favicon from '$lib/assets/favicon.svg';
 import { supabase } from '$lib/supabaseClient';
-import { onMount, onDestroy } from 'svelte';
+import { onMount } from 'svelte';
+import { goto } from '$app/navigation';
 
 let { children } = $props();
 
 let user = $state<any>(null);
 let profile = $state<any>(null);
 
-onMount(async () => {
-const { data: { session } } = await supabase.auth.getSession();
-user = session?.user || null;
-if (user) {
-const { data } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-profile = data;
+function buildDefaultUsername(userData: any) {
+const base = (userData?.user_metadata?.full_name || userData?.email?.split('@')[0] || 'player')
+	.toLowerCase()
+	.replace(/[^a-z0-9]+/g, '_')
+	.replace(/^_+|_+$/g, '')
+	.slice(0, 20) || 'player';
+return `${base}_${userData.id.substring(0, 5)}`;
 }
 
-const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
-user = session?.user || null;
-if (user) {
-const { data } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-profile = data;
-} else {
-profile = null;
+function needsProfileCompletion(profileData: any) {
+return !profileData?.full_name || !profileData?.college || !profileData?.graduation_year;
 }
+
+async function loadProfile(userData: any) {
+if (!userData) {
+profile = null;
+return;
+}
+
+if (userData.is_anonymous) {
+profile = null;
+return;
+}
+
+await supabase
+	.from('profiles')
+	.upsert(
+		{
+			id: userData.id,
+			username: buildDefaultUsername(userData)
+		},
+		{ onConflict: 'id' }
+	)
+	.select();
+
+const { data } = await supabase
+	.from('profiles')
+	.select('role, username, full_name, college, graduation_year')
+	.eq('id', userData.id)
+	.maybeSingle();
+
+profile = data;
+
+if (needsProfileCompletion(data) && window.location.pathname !== '/profile') {
+goto('/profile');
+}
+}
+
+onMount(() => {
+let unsubscribed = false;
+let authListener: { subscription: { unsubscribe: () => void } } | null = null;
+
+async function init() {
+const { data: { session } } = await supabase.auth.getSession();
+if (unsubscribed) return;
+
+user = session?.user || null;
+await loadProfile(user);
+if (unsubscribed) return;
+
+const listener = supabase.auth.onAuthStateChange(async (_event, nextSession) => {
+user = nextSession?.user || null;
+await loadProfile(user);
 });
 
+authListener = listener.data;
+}
+
+init();
+
 return () => {
-authListener.subscription.unsubscribe();
+unsubscribed = true;
+authListener?.subscription.unsubscribe();
 };
 });
 
@@ -56,6 +110,9 @@ await supabase.auth.signOut();
 </a>
 <nav class="ml-auto flex items-center space-x-6 text-sm font-semibold text-gray-300">
 <a href="/play" class="hover:text-white transition-colors">Player Hub</a>
+{#if user && !user.is_anonymous}
+<a href="/profile" class="hover:text-white transition-colors">Profile</a>
+{/if}
 {#if profile?.role === 'admin'}
 <a href="/admin" class="hover:text-white transition-colors border border-red-500/30 text-red-400 bg-red-500/10 px-3 py-1 rounded-md">Admin Dashboard</a>
 {/if}

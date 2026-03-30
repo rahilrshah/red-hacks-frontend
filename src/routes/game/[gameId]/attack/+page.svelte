@@ -1,56 +1,119 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId);
+  let gameName = $state('');
   let challenges = $state<any[]>([]);
   let selectedChallengeId = $state('');
-  let attackPrompt = $state('');
-  let secretKeyGuess = $state('');
+  let initialAttackPrompt = $state('');
   let loading = $state(false);
-  let attackResult = $state<any>(null);
+  let statusError = $state('');
 
   onMount(async () => {
-    // Fetch challenges currently defended by other teams
-    const { data } = await supabase
-      .from('defended_challenges')
-      .select('id, teams!inner(name, game_id, coins), challenges(id, description, type, model_name, attack_steal_coins)')
-      .eq('is_active', true)
-      .eq('teams.game_id', gameId)
-      .gt('teams.coins', 0);
-      
-    if (data) challenges = data;
-  });
+    statusError = '';
 
-  async function performAttack() {
-    loading = true;
-    attackResult = null;
-
-    const { data: user } = await supabase.auth.getUser();
-
-    // In a real implementation this should call a Supabase Edge Function to securely
-    // combine the system prompt and call the LLM to prevent leaking.
     try {
-      const { data, error } = await supabase.functions.invoke('attack', {
-        body: {
-          defended_challenge_id: selectedChallengeId,
-          attacker_user_id: user?.user?.id,
-          prompt: attackPrompt,
-          guess: secretKeyGuess
+      const { data: gameData, error: gameError } = await supabase
+        .from('games')
+        .select('name')
+        .eq('id', gameId)
+        .maybeSingle();
+
+      if (gameError) {
+        statusError = gameError.message;
+        return;
+      }
+
+      gameName = gameData?.name ?? '';
+
+      // Resolve viewer's team for this game so we can hide self-targets.
+      const { data: userData, error: userError } = await supabase.auth.getUser();
+      if (userError) {
+        statusError = userError.message;
+        return;
+      }
+
+      const userId = userData?.user?.id;
+
+      let myTeamId: string | null = null;
+      if (userId) {
+        const { data: membership, error: membershipError } = await supabase
+          .from('team_members')
+          .select('team_id, teams!inner(game_id)')
+          .eq('user_id', userId)
+          .eq('teams.game_id', gameId)
+          .limit(1)
+          .maybeSingle();
+
+        if (membershipError) {
+          statusError = membershipError.message;
+          return;
         }
-      });
+
+        myTeamId = membership?.team_id ?? null;
+      }
+
+      if (!myTeamId) {
+        statusError = 'Could not determine your team for this game, so opponent targets cannot be resolved.';
+        return;
+      }
+
+      const { data: gameChallengeRows, error: gameChallengeError } = await supabase
+        .from('game_challenges')
+        .select('challenge_id')
+        .eq('game_id', gameId);
+
+      if (gameChallengeError) {
+        statusError = gameChallengeError.message;
+        return;
+      }
+
+      const allowedChallengeIds = (gameChallengeRows ?? []).map((row: any) => row.challenge_id);
+      if (allowedChallengeIds.length === 0) {
+        challenges = [];
+        return;
+      }
+
+      // Fetch all defended challenges in this game and hide self-targets.
+      const { data, error } = await supabase
+        .from('defended_challenges')
+        .select('id, team_id, is_active, teams!inner(name, game_id, coins), challenges(id, description, type, model_name, attack_steal_coins)')
+        .eq('teams.game_id', gameId)
+        .in('challenge_id', allowedChallengeIds)
+        .gt('teams.coins', 0) // Only show targets that have coins to steal
+        .neq('team_id', myTeamId);
 
       if (error) {
-        attackResult = { error: error.message || 'Failed to connect to attack server' };
-      } else {
-        attackResult = data;
+        statusError = error.message;
+        return;
       }
-    } catch (e) {
-      attackResult = { error: 'Failed to connect to attack server' };
-    }
 
-    loading = false;
+      challenges = (data ?? []).sort((a: any, b: any) => Number(b.is_active) - Number(a.is_active));
+
+      if (challenges.length > 0) {
+        selectedChallengeId = challenges[0].id;
+      }
+    } catch (err: any) {
+      statusError = err?.message || 'Unexpected error while loading attack targets.';
+    }
+  });
+
+  async function startAttack() {
+    if (!selectedChallengeId || !initialAttackPrompt.trim()) return;
+
+    loading = true;
+
+    try {
+      const seed = encodeURIComponent(initialAttackPrompt.trim());
+      await goto(`/game/${gameId}/attack/${selectedChallengeId}?seed=${seed}`);
+    } catch (err: any) {
+      statusError = err?.message || 'Unable to open attack session.';
+    } finally {
+      loading = false;
+    }
   }
 </script>
 
@@ -59,8 +122,15 @@
     <h1 class="text-4xl font-black tracking-tight text-white mb-2 flex items-center gap-3">
       <span class="text-red-500">⚡</span> Red Team: Attack Interface
     </h1>
+    {#if gameName}
+      <p class="text-gray-300 text-sm mb-2">Game: <span class="font-semibold text-white">{gameName}</span></p>
+    {/if}
     <p class="text-gray-400 text-lg">Select an opponent's defended challenge to attack. Bypass their system prompt to extract the secret key or trigger the forbidden tool!</p>
   </div>
+
+  {#if statusError}
+    <div class="bg-red-500/10 border border-red-500 text-red-500 p-4 rounded-md">{statusError}</div>
+  {/if}
   
   <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
     <div class="col-span-1 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl overflow-hidden h-[600px] flex flex-col shadow-xl">
@@ -75,15 +145,20 @@
           >
             <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors">{target.teams?.name}</div>
             <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.model_name} • {target.challenges?.type}</div>
+            <div class="text-xs mb-2 {target.is_active ? 'text-emerald-300' : 'text-amber-300'}">{target.is_active ? 'Active Defense' : 'Inactive Defense'}</div>
             <div class="text-xs text-gray-300">Team Coins: {target.teams?.coins ?? 0}</div>
             <div class="text-xs text-gray-500 mt-1">Steal on success: {target.challenges?.attack_steal_coins ?? 0}</div>
           </button>
         {/each}
+        {#if challenges.length === 0}
+          <div class="p-5 text-sm text-gray-500">
+            No opponent defended challenges were found for this game yet.
+          </div>
+        {/if}
       </div>
     </div>
 
     <div class="col-span-1 md:col-span-2 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl p-8 flex flex-col shadow-xl relative overflow-hidden">
-      <!-- Background dramatic flare -->
       <div class="absolute top-0 right-0 -mr-20 -mt-20 w-64 h-64 bg-red-500/5 rounded-full blur-[80px] pointer-events-none"></div>
 
       {#if selectedChallengeId}
@@ -102,47 +177,24 @@
 
         <div class="flex-1 space-y-6 relative z-10">
           <div class="space-y-3">
-            <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Your Attack Prompt</p>
+            <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Initial Attack Prompt</p>
             <textarea 
-              bind:value={attackPrompt} 
+              bind:value={initialAttackPrompt}
               class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-48 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm leading-relaxed" 
-              placeholder="> Initialize prompt override..."></textarea>
+              placeholder="> Start with your first attack message..."></textarea>
+            <p class="text-xs text-gray-500">After this message, you will move to a dedicated session page with chat history for this team and challenge.</p>
           </div>
-
-          {#if selected.challenges?.type === 'secret-key'}
-            <div class="space-y-3">
-              <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Secret Key Guess</p>
-              <input 
-                bind:value={secretKeyGuess} 
-                class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm" 
-                placeholder="Submit sequence if extracted..." />
-            </div>
-          {/if}
         </div>
 
         <div class="mt-8 pt-6 border-t border-white/10 relative z-10">
           <button 
-            onclick={performAttack} 
-            disabled={loading || !attackPrompt} 
+            onclick={startAttack}
+            disabled={loading || !initialAttackPrompt.trim()}
             class="bg-red-600 hover:bg-red-500 text-white px-6 py-4 rounded-xl font-bold disabled:opacity-50 transition-all w-full text-lg tracking-wide shadow-[0_0_15px_rgba(220,38,38,0.3)] hover:shadow-[0_0_25px_rgba(220,38,38,0.5)] active:scale-[0.98] uppercase"
           >
-            {loading ? 'EXECUTING INJECTION...' : 'LAUNCH ATTACK'}
+            {loading ? 'PREPARING SESSION...' : 'START ATTACK SESSION'}
           </button>
         </div>
-
-        {#if attackResult}
-          <div class="mt-6 p-5 rounded-xl border relative overflow-hidden z-10 {attackResult.success ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-500'}">
-            <div class="font-black text-lg mb-2 flex items-center gap-2">
-              {attackResult.success ? '✅ TARGET COMPROMISED!' : '❌ ATTACK FAILED'}
-            </div>
-            <div class="text-sm opacity-90 font-medium">{attackResult.message || attackResult.error}</div>
-            {#if attackResult.log}
-              <div class="mt-3 text-xs bg-black/60 p-3 rounded-lg text-gray-300 font-mono h-32 overflow-y-auto border border-white/5">
-                {attackResult.log}
-              </div>
-            {/if}
-          </div>
-        {/if}
       {:else}
         <div class="flex-1 flex flex-col items-center justify-center text-gray-500 space-y-4">
           <div class="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-2">

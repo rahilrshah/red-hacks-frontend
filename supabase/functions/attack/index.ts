@@ -68,6 +68,7 @@ async function applyCoinSteal(
 }
 
 Deno.serve(async (req) => {
+  console.log('hit attack function endpoint')
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -78,16 +79,25 @@ Deno.serve(async (req) => {
   }
 
   try {
+    // Extract authenticated user from JWT (verify_jwt is enabled, so gateway validates this)
+    const attacker_user_id = (req.auth.user as any)?.id
+    
+    if (!attacker_user_id) {
+      return new Response(JSON.stringify({ error: 'Unauthorized: valid JWT required' }), {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+    
     const {
       defended_challenge_id,
-      attacker_user_id,
       prompt,
       guess,
       messages
     } = await req.json()
 
-    if (!defended_challenge_id || !attacker_user_id) {
-      return new Response(JSON.stringify({ error: 'defended_challenge_id and attacker_user_id are required' }), {
+    if (!defended_challenge_id) {
+      return new Response(JSON.stringify({ error: 'defended_challenge_id is required' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
@@ -112,16 +122,38 @@ Deno.serve(async (req) => {
       })
     }
 
+    const gameId = targetDetails.teams?.game_id
+    if (!gameId) {
+      return new Response(JSON.stringify({ error: 'Target is not tied to a valid game' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const { data: allowedGameChallenge, error: allowedGameChallengeError } = await supabaseAdmin
+      .from('game_challenges')
+      .select('challenge_id')
+      .eq('game_id', gameId)
+      .eq('challenge_id', targetDetails.challenge_id)
+      .maybeSingle()
+
+    if (allowedGameChallengeError || !allowedGameChallenge) {
+      return new Response(JSON.stringify({ error: 'This challenge is not enabled for the game' }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
     const { challenges, target_secret_key, system_prompt } = targetDetails
 
     let attackerTeamId: string | null = null
 
-    if (targetDetails.teams?.game_id) {
+    if (gameId) {
       const { data: gameMembership } = await supabaseAdmin
         .from('team_members')
         .select('team_id, teams!inner(game_id)')
         .eq('user_id', attacker_user_id)
-        .eq('teams.game_id', targetDetails.teams.game_id)
+        .eq('teams.game_id', gameId)
         .limit(1)
         .maybeSingle()
 
@@ -157,6 +189,7 @@ Deno.serve(async (req) => {
       .select('created_at')
       .eq('attacker_team_id', attackerTeamId)
       .eq('defended_challenge_id', defended_challenge_id)
+      .eq('is_successful', true)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
@@ -307,7 +340,7 @@ Deno.serve(async (req) => {
           payload.interp_args = challenges.interp_args.configuration;
       }
       
-      const openRouterKey = Deno.env.get('OPENROUTER_KEY') ?? '';
+      const openRouterKey = Deno.env.get('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') ?? '';
       
       const headersInit: HeadersInit = {
           'Content-Type': 'application/json'

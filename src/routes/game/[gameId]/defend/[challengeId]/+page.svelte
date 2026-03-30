@@ -51,8 +51,13 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
 
     teamId = member.team_id;
 
-    const [{ data: challengeRow, error: challengeError }, { data: defenseRow }, { data: teamRows }, { data: attackRows }, { data: teamRow }] = await Promise.all([
-      supabase.from('challenges').select('id, model_name, description, type, defense_reward_coins, attack_steal_coins').eq('id', challengeId).maybeSingle(),
+    const [{ data: gameChallengeRow, error: challengeError }, { data: defenseRow }, { data: teamRows }, { data: attackRows }, { data: teamRow }] = await Promise.all([
+      supabase
+        .from('game_challenges')
+        .select('challenge_id, challenges!inner(id, model_name, description, type, defense_reward_coins, attack_steal_coins)')
+        .eq('game_id', gameId)
+        .eq('challenge_id', challengeId)
+        .maybeSingle(),
       supabase
         .from('defended_challenges')
         .select('id, challenge_id, system_prompt, is_active, created_at, defense_reward_granted')
@@ -69,13 +74,13 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
       supabase.from('teams').select('coins').eq('id', teamId).maybeSingle()
     ]);
 
-    if (challengeError || !challengeRow) {
+    if (challengeError || !gameChallengeRow?.challenges) {
       statusError = 'Challenge not found in this game.';
       loading = false;
       return;
     }
 
-    challenge = challengeRow;
+    challenge = gameChallengeRow.challenges;
     defense = defenseRow ?? null;
     systemPrompt = defense?.system_prompt ?? DEFAULT_DEFENSE_PROMPT;
     teamCoins = teamRow?.coins ?? 0;

@@ -10,16 +10,150 @@
   let startTimeInput: HTMLInputElement | null = null;
   let endTimeInput: HTMLInputElement | null = null;
   let challenges_per_team = $state(5);
+  let allChallenges = $state<any[]>([]);
+  let selectedChallengeIds = $state<string[]>([]);
   let loading = $state(false);
   let errorMsg = $state('');
   let selectedGameId = $state('');
   let teamLoading = $state(false);
   let teamMessage = $state('');
   let teamError = $state(false);
+  let challengeEditorGameId = $state('');
+  let editorSelectedChallengeIds = $state<string[]>([]);
+  let challengeEditorLoading = $state(false);
+  let challengeEditorMessage = $state('');
+  let challengeEditorError = $state(false);
 
   onMount(async () => {
+    await fetchChallenges();
     await fetchGames();
   });
+
+  function allChallengeIds() {
+    return allChallenges.map((challenge) => challenge.id);
+  }
+
+  function toggleChallengeSelection(challengeId: string) {
+    if (selectedChallengeIds.includes(challengeId)) {
+      selectedChallengeIds = selectedChallengeIds.filter((id) => id !== challengeId);
+    } else {
+      selectedChallengeIds = [...selectedChallengeIds, challengeId];
+    }
+  }
+
+  function toggleEditorChallengeSelection(challengeId: string) {
+    if (editorSelectedChallengeIds.includes(challengeId)) {
+      editorSelectedChallengeIds = editorSelectedChallengeIds.filter((id) => id !== challengeId);
+    } else {
+      editorSelectedChallengeIds = [...editorSelectedChallengeIds, challengeId];
+    }
+  }
+
+  async function fetchChallenges() {
+    const { data, error } = await supabase
+      .from('challenges')
+      .select('id, model_name, type, description')
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      errorMsg = error.message;
+      return;
+    }
+
+    allChallenges = data ?? [];
+
+    if (selectedChallengeIds.length === 0) {
+      selectedChallengeIds = allChallengeIds();
+    }
+  }
+
+  async function replaceGameChallenges(gameId: string, challengeIds: string[]) {
+    const uniqueChallengeIds = Array.from(new Set(challengeIds));
+
+    const { error: deleteError } = await supabase
+      .from('game_challenges')
+      .delete()
+      .eq('game_id', gameId);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+
+    if (uniqueChallengeIds.length === 0) {
+      return;
+    }
+
+    const rows = uniqueChallengeIds.map((challengeId) => ({
+      game_id: gameId,
+      challenge_id: challengeId
+    }));
+
+    const { error: insertError } = await supabase
+      .from('game_challenges')
+      .insert(rows);
+
+    if (insertError) {
+      throw insertError;
+    }
+  }
+
+  async function openChallengeEditor(gameId: string) {
+    challengeEditorLoading = true;
+    challengeEditorMessage = '';
+    challengeEditorError = false;
+    challengeEditorGameId = gameId;
+
+    const { data, error } = await supabase
+      .from('game_challenges')
+      .select('challenge_id')
+      .eq('game_id', gameId);
+
+    if (error) {
+      challengeEditorMessage = error.message;
+      challengeEditorError = true;
+      challengeEditorLoading = false;
+      return;
+    }
+
+    editorSelectedChallengeIds = (data ?? []).map((row: any) => row.challenge_id);
+    challengeEditorLoading = false;
+  }
+
+  async function saveChallengeEditor() {
+    if (!challengeEditorGameId) return;
+
+    if (editorSelectedChallengeIds.length === 0) {
+      challengeEditorMessage = 'Select at least one challenge for this game.';
+      challengeEditorError = true;
+      return;
+    }
+
+    challengeEditorLoading = true;
+    challengeEditorMessage = '';
+    challengeEditorError = false;
+
+    try {
+      await replaceGameChallenges(challengeEditorGameId, editorSelectedChallengeIds);
+      challengeEditorMessage = 'Challenge selection saved.';
+      challengeEditorError = false;
+    } catch (error: any) {
+      challengeEditorMessage = error.message;
+      challengeEditorError = true;
+    } finally {
+      challengeEditorLoading = false;
+    }
+  }
+
+  function closeChallengeEditor() {
+    challengeEditorGameId = '';
+    editorSelectedChallengeIds = [];
+    challengeEditorMessage = '';
+    challengeEditorError = false;
+  }
+
+  function challengeEditorGameName() {
+    return games.find((game) => game.id === challengeEditorGameId)?.name ?? '';
+  }
 
   async function fetchGames() {
     const { data, error } = await supabase.from('games').select('*').order('created_at', { ascending: false });
@@ -241,6 +375,12 @@
     loading = true;
     errorMsg = '';
 
+    if (selectedChallengeIds.length === 0) {
+      errorMsg = 'Select at least one challenge for this game.';
+      loading = false;
+      return;
+    }
+
     const dateTimeLocalPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
     if (!dateTimeLocalPattern.test(start_time) || !dateTimeLocalPattern.test(end_time)) {
       errorMsg = 'Please select valid start and end date/time values.';
@@ -273,7 +413,7 @@
     const endIso = endDate.toISOString();
     const initialIsActive = now >= startMs && now <= endMs;
 
-    const { error } = await supabase
+    const { data: createdGame, error } = await supabase
       .from('games')
       .insert([{
         name,
@@ -290,10 +430,20 @@
     if (error) {
       errorMsg = error.message;
     } else {
+      try {
+        await replaceGameChallenges(createdGame.id, selectedChallengeIds);
+      } catch (challengeError: any) {
+        errorMsg = `Game created, but challenge mapping failed: ${challengeError.message}`;
+        loading = false;
+        await fetchGames();
+        return;
+      }
+
       name = '';
       start_time = '';
       end_time = '';
       challenges_per_team = 5;
+      selectedChallengeIds = allChallengeIds();
       await fetchGames();
     }
     
@@ -357,9 +507,57 @@
         <p class="text-sm font-medium text-gray-300">Challenges Per Team</p>
         <input id="game-challenges-per-team" type="number" bind:value={challenges_per_team} min="1" max="20" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
       </div>
+
+      <div class="space-y-3 col-span-2">
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-sm font-medium text-gray-300">Challenges Included In This Game</p>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+              onclick={() => selectedChallengeIds = allChallengeIds()}
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+              onclick={() => selectedChallengeIds = []}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        {#if allChallenges.length === 0}
+          <div class="text-sm text-gray-500 border border-white/10 rounded-lg p-3 bg-black/20">
+            No challenges exist yet. Create at least one challenge before creating a game.
+          </div>
+        {:else}
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-64 overflow-y-auto p-3 border border-white/10 rounded-lg bg-black/20">
+            {#each allChallenges as challenge}
+              <label class="flex items-start gap-3 p-2 rounded hover:bg-white/5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={selectedChallengeIds.includes(challenge.id)}
+                  onchange={() => toggleChallengeSelection(challenge.id)}
+                  class="mt-0.5"
+                />
+                <span class="text-sm text-gray-200">
+                  <span class="font-semibold text-white">{challenge.model_name}</span>
+                  <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
+                  <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
+                </span>
+              </label>
+            {/each}
+          </div>
+        {/if}
+
+        <p class="text-xs text-gray-500">Selected: {selectedChallengeIds.length} / {allChallenges.length}. New games default to all challenges selected.</p>
+      </div>
     </div>
 
-    <button onclick={createGame} disabled={loading || !name || !start_time || !end_time} class="w-full bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 mt-6 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
+    <button onclick={createGame} disabled={loading || !name || !start_time || !end_time || selectedChallengeIds.length === 0 || allChallenges.length === 0} class="w-full bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 mt-6 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
       {loading ? 'Creating...' : 'Create Game'}
     </button>
   </div>
@@ -389,10 +587,19 @@
             </p>
           </div>
           <div class="mt-5 pt-3 border-t border-white/5">
-            <a href="/dashboard/{game.id}" class="text-red-400 hover:text-red-300 text-sm font-bold flex items-center gap-1 group">
-              View Dashboard 
-              <span class="group-hover:translate-x-1 transition-transform">&rarr;</span>
-            </a>
+            <div class="flex items-center justify-between gap-3">
+              <a href="/dashboard/{game.id}" class="text-red-400 hover:text-red-300 text-sm font-bold flex items-center gap-1 group">
+                View Dashboard
+                <span class="group-hover:translate-x-1 transition-transform">&rarr;</span>
+              </a>
+              <button
+                type="button"
+                class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+                onclick={() => openChallengeEditor(game.id)}
+              >
+                Edit Challenges
+              </button>
+            </div>
           </div>
         </div>
       {/each}
@@ -401,6 +608,83 @@
       {/if}
     </div>
   </div>
+
+  {#if challengeEditorGameId}
+    <div class="space-y-4 pt-10 border-t border-white/10">
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-xl font-semibold text-white">Edit Game Challenges</h2>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded border border-white/15 text-xs text-gray-300 hover:bg-white/10"
+          onclick={closeChallengeEditor}
+        >
+          Close
+        </button>
+      </div>
+      <p class="text-sm text-gray-400">Game: <span class="text-white font-semibold">{challengeEditorGameName()}</span></p>
+
+      {#if challengeEditorMessage}
+        <div class="p-3 rounded-md border {challengeEditorError ? 'bg-red-500/10 border-red-500/40 text-red-400' : 'bg-green-500/10 border-green-500/40 text-green-300'}">
+          {challengeEditorMessage}
+        </div>
+      {/if}
+
+      <div class="border border-white/10 bg-slate-900/40 rounded-xl p-5 space-y-4">
+        <div class="flex items-center justify-between gap-2">
+          <p class="text-sm font-medium text-gray-300">Included challenges</p>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+              onclick={() => editorSelectedChallengeIds = allChallengeIds()}
+              disabled={challengeEditorLoading}
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+              onclick={() => editorSelectedChallengeIds = []}
+              disabled={challengeEditorLoading}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-72 overflow-y-auto p-3 border border-white/10 rounded-lg bg-black/20">
+          {#each allChallenges as challenge}
+            <label class="flex items-start gap-3 p-2 rounded hover:bg-white/5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={editorSelectedChallengeIds.includes(challenge.id)}
+                onchange={() => toggleEditorChallengeSelection(challenge.id)}
+                disabled={challengeEditorLoading}
+                class="mt-0.5"
+              />
+              <span class="text-sm text-gray-200">
+                <span class="font-semibold text-white">{challenge.model_name}</span>
+                <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
+                <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
+              </span>
+            </label>
+          {/each}
+        </div>
+
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-xs text-gray-500">Selected: {editorSelectedChallengeIds.length} / {allChallenges.length}</p>
+          <button
+            type="button"
+            class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-bold disabled:opacity-50"
+            onclick={saveChallengeEditor}
+            disabled={challengeEditorLoading || editorSelectedChallengeIds.length === 0}
+          >
+            {challengeEditorLoading ? 'Saving...' : 'Save Challenge Selection'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <div class="space-y-4 pt-10 border-t border-white/10">
     <h2 class="text-xl font-semibold text-white">Manage Teams</h2>

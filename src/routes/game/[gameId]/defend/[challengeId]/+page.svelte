@@ -18,8 +18,14 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
   let teamId = $state('');
   let teamCoins = $state<number>(0);
   let systemPrompt = $state(DEFAULT_DEFENSE_PROMPT);
+  let targetSecretKey = $state('');
   let statusMessage = $state('');
   let statusError = $state('');
+
+  function generateSecretKey() {
+    const compact = crypto.randomUUID().replace(/-/g, '').slice(0, 20).toUpperCase();
+    return `FLAG{${compact}}`;
+  }
 
   onMount(async () => {
     await loadPage();
@@ -60,7 +66,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
         .maybeSingle(),
       supabase
         .from('defended_challenges')
-        .select('id, challenge_id, system_prompt, is_active, created_at, defense_reward_granted')
+        .select('id, challenge_id, system_prompt, target_secret_key, is_active, created_at, defense_reward_granted')
         .eq('team_id', teamId)
         .eq('challenge_id', challengeId)
         .maybeSingle(),
@@ -83,6 +89,29 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
     challenge = gameChallengeRow.challenges;
     defense = defenseRow ?? null;
     systemPrompt = defense?.system_prompt ?? DEFAULT_DEFENSE_PROMPT;
+
+    if (challenge?.type === 'secret-key') {
+      targetSecretKey = defense?.target_secret_key?.trim() || generateSecretKey();
+
+      if (defense?.id && !defense?.target_secret_key?.trim()) {
+        const { data: patchedDefense, error: patchDefenseError } = await supabase
+          .from('defended_challenges')
+          .update({ target_secret_key: targetSecretKey })
+          .eq('id', defense.id)
+          .select('id, challenge_id, system_prompt, target_secret_key, is_active, created_at, defense_reward_granted')
+          .single();
+
+        if (patchDefenseError) {
+          statusError = patchDefenseError.message;
+        } else {
+          defense = patchedDefense;
+          statusMessage = 'A missing secret key was generated and saved for this defense.';
+        }
+      }
+    } else {
+      targetSecretKey = '';
+    }
+
     teamCoins = teamRow?.coins ?? 0;
 
     const teamNameById = new Map((teamRows ?? []).map((team: any) => [team.id, team.name]));
@@ -103,6 +132,12 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
       return;
     }
 
+    const trimmedSecretKey = targetSecretKey.trim();
+    if (challenge?.type === 'secret-key' && !trimmedSecretKey) {
+      statusError = 'Secret key is required for secret-key challenges.';
+      return;
+    }
+
     saving = true;
     statusError = '';
     statusMessage = '';
@@ -115,11 +150,12 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
           team_id: teamId,
           challenge_id: challengeId,
           system_prompt: trimmedPrompt,
+          target_secret_key: challenge?.type === 'secret-key' ? trimmedSecretKey : null,
           is_active: true
         },
         { onConflict: 'team_id,challenge_id' }
       )
-      .select('id, challenge_id, system_prompt, is_active, created_at, defense_reward_granted')
+      .select('id, challenge_id, system_prompt, target_secret_key, is_active, created_at, defense_reward_granted')
       .single();
 
     if (error || !data) {
@@ -225,6 +261,28 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
         ></textarea>
         <p class="text-xs text-gray-500">Default text is prefilled so you can quickly start from a secure baseline.</p>
       </div>
+
+      {#if challenge.type === 'secret-key'}
+        <div class="space-y-2">
+          <label for="defense-secret-key" class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Target Secret Key</label>
+          <input
+            id="defense-secret-key"
+            bind:value={targetSecretKey}
+            class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 outline-none placeholder:text-gray-500 font-mono text-sm"
+            placeholder={'FLAG{YOUR_SECRET_KEY}'}
+          />
+          <div class="flex items-center gap-3">
+            <button
+              type="button"
+              onclick={() => (targetSecretKey = generateSecretKey())}
+              class="border border-white/20 hover:border-white/40 text-white px-3 py-2 rounded-md text-xs font-medium transition"
+            >
+              Generate New Key
+            </button>
+            <span class="text-xs text-gray-500">Attackers must extract this exact value to win.</span>
+          </div>
+        </div>
+      {/if}
 
       <div class="flex items-center gap-3">
         <button

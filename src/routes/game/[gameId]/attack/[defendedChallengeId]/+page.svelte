@@ -135,8 +135,22 @@
       return;
     }
 
+    const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+    const accessToken = sessionData?.session?.access_token;
+
+    if (sessionError || !accessToken) {
+      attackResult = {
+        error: 'Your session is missing or expired. Please sign in again.',
+        success: false
+      };
+      return;
+    }
+
     console.log('Starting attack')
     const { data, error } = await supabase.functions.invoke('attack', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      },
       body: {
         defended_challenge_id: defendedChallengeId,
         prompt: messages.length > 0 ? messages[messages.length - 1].content : '',

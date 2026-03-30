@@ -304,7 +304,7 @@ max_frequency = "5s"
 # `twitter`, `x`, `slack`, `spotify`, `workos`, `zoom`.
 [auth.external.google]
 enabled = true
-client_id = "206508373924-cab5igdhh675f77h9n7uqvm5la7d464q.apps.googleusercontent.com"
+client_id = "env(GOOGLE_CLIENT_ID)"
 secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"
 skip_nonce_check = true
 redirect_uri = "env(SUPABASE_AUTH_CALLBACK_URL)"

@@ -340,7 +340,7 @@ Deno.serve(async (req) => {
           payload.interp_args = challenges.interp_args.configuration;
       }
       
-      const openRouterKey = Deno.env.get('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') ?? '';
+      const openRouterKey = Deno.env.get('OPENROUTER_KEY') ?? '';
       
       const headersInit: HeadersInit = {
           'Content-Type': 'application/json'

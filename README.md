@@ -1,42 +1,81 @@
-# sv
+# Red Hacks Frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Web app for a red-team/blue-team prompt-security game. Players join games and teams, configure defenses, attack opponent defenses, and earn/lose coins based on challenge outcomes.
 
-## Creating a project
+Tech stack:
+- SvelteKit 5 + TypeScript
+- Tailwind CSS 4
+- Supabase (Auth, Postgres, Storage, Edge Functions)
 
-If you're seeing this, you've probably already done this step. Congrats!
+## Quick Start
 
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
+1. Install dependencies:
 
 ```sh
-# recreate this project
-pnpm dlx sv@0.12.8 create --template minimal --types ts --add tailwindcss="plugins:none" --install pnpm .
+pnpm install
 ```
 
-## Developing
+2. Create `.env` in the project root:
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+```env
+PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+PUBLIC_SUPABASE_ANON_KEY=<from local Supabase output>
+```
+
+3. Start Supabase locally:
 
 ```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+npx supabase start
 ```
 
-## Building
-
-To create a production version of your app:
+4. Start the frontend:
 
 ```sh
-npm run build
+pnpm dev
 ```
 
-You can preview the production build with `npm run preview`.
+5. Open the app and run a smoke test:
+- Go to `/play`
+- Enter a game invite code
+- Create or join a team
+- Enter a game and visit defend/attack pages
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+## Scripts
+
+- `pnpm dev`: Run Vite dev server
+- `pnpm build`: Build production bundle
+- `pnpm preview`: Preview production bundle
+- `pnpm check`: Run SvelteKit sync + type checks
+- `pnpm check:watch`: Type checks in watch mode
+
+## Project Structure
+
+- `src/routes`: Player, admin, game, and team pages
+- `src/lib/supabaseClient.ts`: Browser Supabase client setup
+- `supabase/migrations`: Schema and policy migrations
+- `supabase/functions/attack`: Attack resolution Edge Function
+- `supabase/seed.sql`: Local seed data for development
+
+## Core Concepts
+
+- Game: Top-level competition with an invite code
+- Team: Group inside a game, with coin balance
+- Challenge: Attack/defense scenario with a model and type
+- Defended challenge: Team's configured defense for a challenge
+- Attack: Attempt against an opponent defense; may transfer coins
+
+## Documentation Index
+
+- `docs/getting-started.md`
+- `docs/architecture.md`
+- `docs/database.md`
+- `docs/edge-functions.md`
+- `docs/gameplay-flows.md`
+- `docs/game.md`
+- `docs/security.md`
+- `docs/troubleshooting.md`
+
+## Notes
+
+- Local auth/sign-in behavior for players relies on anonymous auth in player flows.
+- Supabase Edge Function auth should support gateway auth context and bearer-token fallback in local/dev.

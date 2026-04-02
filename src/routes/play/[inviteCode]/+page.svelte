@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { isGameActive } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
 
-  let inviteCode = $page.params.inviteCode;
+  let inviteCode = $derived($page.params.inviteCode ?? '');
   let game = $state<any>(null);
   
   // Forms state
@@ -39,6 +40,13 @@
         loading = false;
         return;
       }
+
+      if (!isGameActive(gameData)) {
+        actionMessage = 'This game is currently inactive.';
+        actionError = true;
+        loading = false;
+        return;
+      }
       
       game = gameData;
       
@@ -49,9 +57,14 @@
         .eq('user_id', userId);
         
       if (memberData && memberData.length > 0) {
-        const teamForGame = memberData.find(m => m.teams.game_id === game.id);
+        const teamForGame = (memberData as any[]).find((m: any) => {
+          const team = Array.isArray(m.teams) ? m.teams[0] : m.teams;
+          return team?.game_id === game.id;
+        });
         if (teamForGame) {
-          existingTeam = teamForGame.teams;
+          existingTeam = Array.isArray((teamForGame as any).teams)
+            ? (teamForGame as any).teams[0]
+            : (teamForGame as any).teams;
           // Optionally auto-redirect
           // goto(`/game/${game.id}`);
         }
@@ -62,6 +75,11 @@
 
   async function createTeam() {
     if (!newTeamName || !game) return;
+    if (!isGameActive(game)) {
+      actionMessage = 'This game is currently inactive.';
+      actionError = true;
+      return;
+    }
     loading = true;
     actionError = false;
     
@@ -93,6 +111,11 @@
 
   async function joinTeam() {
     if (!teamInviteCode) return;
+    if (!game || !isGameActive(game)) {
+      actionMessage = 'This game is currently inactive.';
+      actionError = true;
+      return;
+    }
     loading = true;
     actionError = false;
     
@@ -185,8 +208,8 @@
           
           <div class="space-y-4">
             <div class="space-y-2">
-              <label class="text-sm font-semibold text-gray-300">Team Name</label>
-              <input bind:value={newTeamName} placeholder="e.g. Protocol Breakers" class="w-full bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+              <label for="new-team-name" class="text-sm font-semibold text-gray-300">Team Name</label>
+              <input id="new-team-name" bind:value={newTeamName} placeholder="e.g. Protocol Breakers" class="w-full bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
             </div>
           </div>
         </div>
@@ -203,8 +226,8 @@
           <p class="text-gray-400 mb-6">Have an invite code from your team leader? Enter it here to join their squad.</p>
           
           <div class="space-y-4">
-            <label class="text-sm font-semibold text-gray-300">Team Invite Code</label>
-            <input bind:value={teamInviteCode} placeholder="E.g. A1B2C3" class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white text-center text-xl tracking-[0.3em] font-mono uppercase focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all" maxlength="6" />
+            <label for="team-invite-code" class="text-sm font-semibold text-gray-300">Team Invite Code</label>
+            <input id="team-invite-code" bind:value={teamInviteCode} placeholder="E.g. A1B2C3" class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white text-center text-xl tracking-[0.3em] font-mono uppercase focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 outline-none transition-all" maxlength="6" />
           </div>
         </div>
         <button onclick={joinTeam} disabled={loading || teamInviteCode.length < 6} class="w-full bg-blue-600 hover:bg-blue-500 text-white px-6 py-4 rounded-xl font-bold disabled:opacity-50 transition-all text-lg tracking-wide shadow-[0_0_15px_rgba(37,99,235,0.3)] hover:shadow-[0_0_25px_rgba(37,99,235,0.5)] active:scale-[0.98] mt-6">

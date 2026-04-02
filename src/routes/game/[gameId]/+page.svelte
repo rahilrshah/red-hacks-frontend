@@ -1,10 +1,18 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
-  let gameId = $derived($page.params.gameId);
+  let gameId = $derived($page.params.gameId ?? '');
   let game = $state<any>(null);
+  let roundInfo = $state<any>(null);
+  let roundPhase = $state('no-rounds');
+  let phaseTimeRemaining = $state<number | null>(null);
+  let allowedChallengeCount = $state(0);
+  let defendedChallengeCount = $state(0);
+  let attackTargetCount = $state(0);
+  let gameplaySummaryLoading = $state(false);
   let myTeam = $state<any>(null);
 
   let newTeamName = $state('');
@@ -20,11 +28,20 @@
     return rawValue.toUpperCase().trim().replace(/^TEAM:/, '').trim();
   }
 
-  function isGameActive(gameData: { is_active: boolean; start_time: string; end_time: string }) {
-    const now = Date.now();
-    const start = new Date(gameData.start_time).getTime();
-    const end = new Date(gameData.end_time).getTime();
-    return Boolean(gameData.is_active) && !Number.isNaN(start) && !Number.isNaN(end) && now >= start && now <= end;
+  function phaseLabel(phase: string) {
+    if (phase === 'pre-game') return 'Pre-Game';
+    if (phase === 'round-active') return 'Round Active';
+    if (phase === 'intermission') return 'Intermission';
+    if (phase === 'post-game') return 'Game Over';
+    return 'No Rounds Configured';
+  }
+
+  function formatRemaining(seconds: number | null) {
+    if (seconds === null) return null;
+    const total = Math.max(0, Math.trunc(seconds));
+    const minutes = Math.floor(total / 60);
+    const remainder = total % 60;
+    return `${minutes}m ${remainder.toString().padStart(2, '0')}s`;
   }
 
   onMount(async () => {
@@ -59,6 +76,10 @@
     }
 
     game = gameRow;
+    const runtimeContext = await loadRoundRuntimeContext(supabase, gameId);
+    roundInfo = runtimeContext.currentRound;
+    roundPhase = runtimeContext.phase;
+    phaseTimeRemaining = runtimeContext.timeRemainingSeconds;
     await fetchUserData();
     pageLoading = false;
   });
@@ -82,9 +103,69 @@
             game: teamGame
           }
         : null;
+
+      if (myTeam?.id) {
+        await loadGameplaySummary(myTeam.id);
+      }
     } else {
       myTeam = null;
+      allowedChallengeCount = 0;
+      defendedChallengeCount = 0;
+      attackTargetCount = 0;
     }
+  }
+
+  async function loadGameplaySummary(teamId: string) {
+    gameplaySummaryLoading = true;
+
+    try {
+      const allowedChallengeIds = await loadRoundChallengeIds(supabase, gameId, roundInfo);
+      allowedChallengeCount = allowedChallengeIds.length;
+
+      const { count: defendedCount } = await supabase
+        .from('defended_challenges')
+        .select('id', { count: 'exact', head: true })
+        .eq('team_id', teamId)
+        .in('challenge_id', allowedChallengeIds.length > 0 ? allowedChallengeIds : ['00000000-0000-0000-0000-000000000000']);
+
+      defendedChallengeCount = defendedCount ?? 0;
+
+      if (resolveRoundType(roundInfo) === 'pvp') {
+        const { count: targetsCount } = await supabase
+          .from('defended_challenges')
+          .select('id, teams!inner(game_id, coins)', { count: 'exact', head: true })
+          .eq('teams.game_id', gameId)
+          .neq('team_id', teamId)
+          .gt('teams.coins', 0)
+          .in('challenge_id', allowedChallengeIds.length > 0 ? allowedChallengeIds : ['00000000-0000-0000-0000-000000000000']);
+
+        attackTargetCount = targetsCount ?? 0;
+      } else {
+        attackTargetCount = allowedChallengeIds.length;
+      }
+    } finally {
+      gameplaySummaryLoading = false;
+    }
+  }
+
+  function recommendedAction() {
+    if (roundPhase === 'intermission') {
+      return 'Intermission is active. Review team setup and get ready for the next round.';
+    }
+
+    if (roundPhase !== 'round-active') {
+      return 'Wait for an active round to begin before attacking or updating defenses.';
+    }
+
+    if (defendedChallengeCount === 0) {
+      return 'Set up at least one defense first so your team is protected this round.';
+    }
+
+    if (attackTargetCount === 0) {
+      return 'No attack targets are currently available. Keep defenses fresh and watch for new targets.';
+    }
+
+    return 'Your team is ready. Defend weak spots and launch attacks while this round is active.';
   }
 
   async function createTeam() {
@@ -207,6 +288,26 @@
       {#if game?.invite_code}
         <p class="text-gray-300 mt-3">Game Invite Code: <span class="font-mono text-red-400 tracking-wider font-bold">{game.invite_code}</span></p>
       {/if}
+      {#if roundInfo}
+        <div class="mt-4 inline-flex flex-wrap items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-gray-300">
+          <span class="font-semibold text-white">Current Round:</span>
+          <span>{roundInfo.name}</span>
+          <span class="text-gray-500">•</span>
+          <span class="uppercase tracking-wider text-red-300">{resolveRoundType(roundInfo)}</span>
+          {#if resolveRoundType(roundInfo) === 'pve'}
+            <span class="text-gray-500">•</span>
+            <span>Default prompt defense</span>
+          {/if}
+        </div>
+      {/if}
+      <div class="mt-3 inline-flex flex-wrap items-center gap-2 rounded-full border border-white/10 bg-black/30 px-4 py-2 text-xs text-gray-300">
+        <span class="font-semibold text-white">Phase:</span>
+        <span>{phaseLabel(roundPhase)}</span>
+        {#if formatRemaining(phaseTimeRemaining)}
+          <span class="text-gray-500">•</span>
+          <span>{formatRemaining(phaseTimeRemaining)} remaining</span>
+        {/if}
+      </div>
     </div>
 
     {#if actionMessage}
@@ -234,10 +335,34 @@
           </div>
         {/if}
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
           <a href={`/game/${gameId}/team/${myTeam.id}`} class="text-center px-4 py-2 bg-white/10 hover:bg-white/20 text-gray-200 border border-white/20 rounded-lg font-bold text-sm transition-colors">Manage</a>
           <a href={`/game/${gameId}/defend`} class="text-center px-4 py-2 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 rounded-lg font-bold text-sm transition-colors">Defend</a>
           <a href={`/game/${gameId}/attack`} class="text-center px-4 py-2 bg-red-600/20 hover:bg-red-600/40 text-red-500 border border-red-500/30 rounded-lg font-bold text-sm transition-colors">Attack</a>
+          <a href={`/game/${gameId}/live-events`} class="text-center px-4 py-2 bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/30 rounded-lg font-bold text-sm transition-colors">Live Events</a>
+        </div>
+
+        <div class="border border-white/10 rounded-xl bg-black/30 p-4 space-y-3">
+          <p class="text-xs uppercase tracking-[0.2em] text-gray-400">Mission Control</p>
+          {#if gameplaySummaryLoading}
+            <p class="text-sm text-gray-400">Refreshing round action summary...</p>
+          {:else}
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+              <div class="rounded-lg border border-white/10 bg-white/5 p-3">
+                <p class="text-gray-400">Round Challenges</p>
+                <p class="text-white font-bold text-xl mt-1">{allowedChallengeCount}</p>
+              </div>
+              <div class="rounded-lg border border-blue-500/20 bg-blue-500/10 p-3">
+                <p class="text-blue-200">Defenses Configured</p>
+                <p class="text-white font-bold text-xl mt-1">{defendedChallengeCount}</p>
+              </div>
+              <div class="rounded-lg border border-red-500/20 bg-red-500/10 p-3">
+                <p class="text-red-200">Attack Targets</p>
+                <p class="text-white font-bold text-xl mt-1">{attackTargetCount}</p>
+              </div>
+            </div>
+            <p class="text-sm text-gray-300">{recommendedAction()}</p>
+          {/if}
         </div>
       </div>
     {:else}

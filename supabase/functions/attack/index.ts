@@ -7,6 +7,16 @@ type ChatMessage = {
   content: string
 }
 
+type RoundRow = {
+  game_id: string
+  round_index: number
+  type: 'pvp' | 'pve' | string
+  required_defenses: number | null
+  available_challenges: string[] | null
+  duration_minutes: number | null
+  intermission_minutes: number | null
+}
+
 function normalizeMessages(messages: unknown): ChatMessage[] {
   if (!Array.isArray(messages)) return []
 
@@ -26,6 +36,55 @@ function extractToolCallNames(message: any): string[] {
   return toolCalls
     .map((call) => call?.function?.name)
     .filter((name): name is string => typeof name === 'string' && name.length > 0)
+}
+
+function extractSecretKey(...sources: unknown[]): string | null {
+  for (const source of sources) {
+    if (typeof source !== 'string') continue
+
+    const match = source.match(/FLAG\{[^}]+\}/i)
+    if (match?.[0]) {
+      return match[0]
+    }
+  }
+
+  return null
+}
+
+function asValidDateMs(value: string | null | undefined): number | null {
+  if (!value) return null
+  const ms = new Date(value).getTime()
+  if (Number.isNaN(ms)) return null
+  return ms
+}
+
+function normalizeMinutes(value: number | null | undefined, minimum: number): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) return minimum
+  return Math.max(minimum, Math.trunc(value))
+}
+
+function resolveActiveRound(gameStartIso: string, rounds: RoundRow[], nowMs: number): RoundRow | null {
+  const gameStartMs = asValidDateMs(gameStartIso)
+  if (gameStartMs === null) return null
+
+  const ordered = [...rounds].sort((a, b) => a.round_index - b.round_index)
+  let cursorMs = gameStartMs
+
+  for (const round of ordered) {
+    const durationMs = normalizeMinutes(round.duration_minutes, 1) * 60_000
+    const intermissionMs = normalizeMinutes(round.intermission_minutes, 0) * 60_000
+    const startMs = cursorMs
+    const endMs = startMs + durationMs
+    const intermissionEndMs = endMs + intermissionMs
+
+    if (nowMs >= startMs && nowMs < endMs) {
+      return round
+    }
+
+    cursorMs = intermissionEndMs
+  }
+
+  return null
 }
 
 async function uploadAttackTranscript(supabaseAdmin: any, defendedChallengeId: string, attackLog: Record<string, unknown>) {
@@ -109,54 +168,125 @@ Deno.serve(async (req) => {
     
     const {
       defended_challenge_id,
+      challenge_id,
+      game_id,
+      round_type,
       prompt,
       guess,
       messages
     } = await req.json()
 
-    if (!defended_challenge_id) {
-      return new Response(JSON.stringify({ error: 'defended_challenge_id is required' }), {
+    if (!defended_challenge_id && !challenge_id) {
+      return new Response(JSON.stringify({ error: 'defended_challenge_id or challenge_id is required' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
 
-    const { data: targetDetails, error: targetError } = await supabaseAdmin
-      .from('defended_challenges')
-      .select('*, challenges(*, interp_args(*)), teams(name, game_id, coins)')
-      .eq('id', defended_challenge_id)
-      .single()
+    let targetDetails: any = null
+    let gameId: string | null = null
+    let isPveTarget = false
 
-    if (targetError || !targetDetails) {
-      return new Response(JSON.stringify({ error: 'Target not found' }), {
-        status: 404,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
-    }
+    if (defended_challenge_id) {
+      const { data: defendedTarget, error: targetError } = await supabaseAdmin
+        .from('defended_challenges')
+        .select('*, challenges(*, interp_args(*)), teams(name, game_id, coins)')
+        .eq('id', defended_challenge_id)
+        .single()
 
-    const gameId = targetDetails.teams?.game_id
-    if (!gameId) {
-      return new Response(JSON.stringify({ error: 'Target is not tied to a valid game' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
-    }
+      if (targetError || !defendedTarget) {
+        return new Response(JSON.stringify({ error: 'Target not found' }), {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
 
-    const { data: allowedGameChallenge, error: allowedGameChallengeError } = await supabaseAdmin
-      .from('game_challenges')
-      .select('challenge_id')
-      .eq('game_id', gameId)
-      .eq('challenge_id', targetDetails.challenge_id)
-      .maybeSingle()
+      gameId = defendedTarget.teams?.game_id ?? null
 
-    if (allowedGameChallengeError || !allowedGameChallenge) {
-      return new Response(JSON.stringify({ error: 'This challenge is not enabled for the game' }), {
-        status: 403,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
+      if (!gameId) {
+        return new Response(JSON.stringify({ error: 'Target is not tied to a valid game' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      const { data: allowedGameChallenge, error: allowedGameChallengeError } = await supabaseAdmin
+        .from('game_challenges')
+        .select('challenge_id')
+        .eq('game_id', gameId)
+        .eq('challenge_id', defendedTarget.challenge_id)
+        .maybeSingle()
+
+      if (allowedGameChallengeError || !allowedGameChallenge) {
+        return new Response(JSON.stringify({ error: 'This challenge is not enabled for the game' }), {
+          status: 403,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      targetDetails = defendedTarget
+    } else {
+      if (!game_id) {
+        return new Response(JSON.stringify({ error: 'game_id is required for pve attacks' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      const { data: roundDetails, error: roundError } = await supabaseAdmin
+        .from('rounds')
+        .select('game_id, round_index, name, type, available_challenges')
+        .eq('game_id', game_id)
+        .contains('available_challenges', [challenge_id])
+        .order('round_index', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (roundError || !roundDetails) {
+        return new Response(JSON.stringify({ error: 'Challenge is not enabled for the current round' }), {
+          status: 403,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      const { data: challengeData, error: challengeError } = await supabaseAdmin
+        .from('challenges')
+        .select('*, interp_args(*)')
+        .eq('id', challenge_id)
+        .single()
+
+      if (challengeError || !challengeData) {
+        return new Response(JSON.stringify({ error: 'Challenge not found' }), {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      gameId = roundDetails.game_id
+      isPveTarget = true
+      targetDetails = {
+        id: `${game_id}:${challenge_id}`,
+        team_id: null,
+        challenge_id,
+        defended_challenge_id: null,
+        target_secret_key: null,
+        system_prompt: challengeData.default_prompt?.trim() || challengeData.context?.trim() || 'You are a helpful assistant.',
+        teams: {
+          name: roundDetails.name ?? 'Default Defense',
+          game_id: roundDetails.game_id,
+          coins: 0
+        },
+        challenges: challengeData
+      }
     }
 
     const { challenges, target_secret_key, system_prompt } = targetDetails
+    const configuredSecretKey = extractSecretKey(
+      target_secret_key,
+      challenges?.context,
+      challenges?.default_prompt,
+      system_prompt
+    )
 
     let attackerTeamId: string | null = null
 
@@ -179,14 +309,100 @@ Deno.serve(async (req) => {
       })
     }
 
-    if (attackerTeamId === targetDetails.team_id) {
+    const { data: gameWindow, error: gameWindowError } = await supabaseAdmin
+      .from('games')
+      .select('is_active, start_time, end_time')
+      .eq('id', gameId)
+      .maybeSingle()
+
+    if (gameWindowError || !gameWindow) {
+      return new Response(JSON.stringify({ error: 'Could not load game timing configuration' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const nowMs = Date.now()
+    const gameStartMs = asValidDateMs(gameWindow.start_time)
+    const gameEndMs = asValidDateMs(gameWindow.end_time)
+
+    if (!gameWindow.is_active || gameStartMs === null || gameEndMs === null || nowMs < gameStartMs || nowMs > gameEndMs) {
+      return new Response(JSON.stringify({ error: 'This game is not currently active' }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const { data: roundRows, error: roundRowsError } = await supabaseAdmin
+      .from('rounds')
+      .select('game_id, round_index, type, required_defenses, available_challenges, duration_minutes, intermission_minutes')
+      .eq('game_id', gameId)
+      .order('round_index', { ascending: true })
+
+    if (roundRowsError) {
+      return new Response(JSON.stringify({ error: 'Could not load round configuration' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const activeRound = resolveActiveRound(gameWindow.start_time, (roundRows ?? []) as RoundRow[], nowMs)
+    if (!activeRound) {
+      return new Response(JSON.stringify({ error: 'There is no active round to attack right now' }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const activeRoundChallengeIds = (activeRound.available_challenges ?? []).filter((challengeId): challengeId is string => typeof challengeId === 'string' && challengeId.length > 0)
+    const effectiveChallengeId = (isPveTarget ? challenge_id : targetDetails.challenge_id) as string | null
+
+    if (!effectiveChallengeId || !activeRoundChallengeIds.includes(effectiveChallengeId)) {
+      return new Response(JSON.stringify({ error: 'This challenge is not enabled in the active round' }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    if (activeRound.type === 'pvp') {
+      const requiredDefenses = Math.max(0, Math.trunc(activeRound.required_defenses ?? 0))
+
+      if (requiredDefenses > 0) {
+        const { count: defendedCount, error: defendedCountError } = await supabaseAdmin
+          .from('defended_challenges')
+          .select('id', { count: 'exact', head: true })
+          .eq('team_id', attackerTeamId)
+          .eq('is_active', true)
+          .in('challenge_id', activeRoundChallengeIds)
+
+        if (defendedCountError) {
+          return new Response(JSON.stringify({ error: 'Could not verify defended prompts requirement' }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+
+        if ((defendedCount ?? 0) < requiredDefenses) {
+          return new Response(JSON.stringify({
+            error: `Attack blocked. Defend at least ${requiredDefenses} prompt(s) for this round before attacking.`,
+            required_defenses: requiredDefenses,
+            defended_count: defendedCount ?? 0
+          }), {
+            status: 403,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+      }
+    }
+
+    if (!isPveTarget && attackerTeamId === targetDetails.team_id) {
       return new Response(JSON.stringify({ error: 'You cannot attack your own team defense' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
 
-    if ((targetDetails.teams?.coins ?? 0) <= 0) {
+    if (!isPveTarget && (targetDetails.teams?.coins ?? 0) <= 0) {
       return new Response(JSON.stringify({
         success: false,
         message: 'Target team is already eliminated (0 coins).',
@@ -196,11 +412,13 @@ Deno.serve(async (req) => {
       })
     }
 
+    const cooldownTargetColumn = isPveTarget ? 'challenge_id' : 'defended_challenge_id'
+
     const { data: mostRecentAttack, error: mostRecentAttackError } = await supabaseAdmin
       .from('attacks')
       .select('created_at')
       .eq('attacker_team_id', attackerTeamId)
-      .eq('defended_challenge_id', defended_challenge_id)
+      .eq(cooldownTargetColumn, isPveTarget ? challenge_id : defended_challenge_id)
       .eq('is_successful', true)
       .order('created_at', { ascending: false })
       .limit(1)
@@ -249,47 +467,52 @@ Deno.serve(async (req) => {
       attacker_user_id,
       attacker_team_id: attackerTeamId,
       used_guess: guess ?? null,
-      messages: finalUserMessages
+      messages: finalUserMessages,
+      round_type: isPveTarget ? 'pve' : 'pvp'
     }
 
     if (challenges.type === 'secret-key' && guess) {
-      if (!target_secret_key) {
+      if (!configuredSecretKey) {
         return new Response(JSON.stringify({
           success: false,
-          message: 'This defense has no secret key configured yet.',
+          message: 'This challenge has no secret key configured yet.',
           log: 'Target configuration error: missing secret key.'
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
 
-      if (guess.toLowerCase().trim() === target_secret_key.toLowerCase().trim()) {
-        const transferResult = await applyCoinSteal(
-          supabaseAdmin,
-          attackerTeamId,
-          targetDetails.team_id,
-          challenges.id
-        )
+      if (guess.toLowerCase().trim() === configuredSecretKey.toLowerCase().trim()) {
+        let transferResult: any = null
 
-        if (transferResult.defender_eliminated) {
-          await supabaseAdmin
-            .from('defended_challenges')
-            .update({ is_active: false })
-            .eq('team_id', targetDetails.team_id)
+        if (!isPveTarget) {
+          transferResult = await applyCoinSteal(
+            supabaseAdmin,
+            attackerTeamId,
+            targetDetails.team_id,
+            challenges.id
+          )
+
+          if (transferResult.defender_eliminated) {
+            await supabaseAdmin
+              .from('defended_challenges')
+              .update({ is_active: false })
+              .eq('team_id', targetDetails.team_id)
+          }
         }
 
-        // Log attack win
         const attackLog = {
           ...attackLogBase,
           victory_condition: 'secret-key',
           outcome: 'success',
           assistant_message: 'System breached. Key accepted.',
-          stolen_coins: transferResult.stolen_coins,
-          defender_coins_after: transferResult.defender_coins,
-          attacker_coins_after: transferResult.attacker_coins,
-          defender_eliminated: transferResult.defender_eliminated
+          stolen_coins: transferResult?.stolen_coins ?? 0,
+          defender_coins_after: transferResult?.defender_coins ?? null,
+          attacker_coins_after: transferResult?.attacker_coins ?? null,
+          defender_eliminated: transferResult?.defender_eliminated ?? false
         }
 
         await supabaseAdmin.from('attacks').insert({
           defended_challenge_id,
+          challenge_id: isPveTarget ? challenge_id : null,
           attacker_user_id,
           attacker_team_id: attackerTeamId,
           is_successful: true,
@@ -297,13 +520,15 @@ Deno.serve(async (req) => {
         })
 
         await uploadAttackTranscript(supabaseAdmin, defended_challenge_id, attackLog)
-            
-        return new Response(JSON.stringify({ 
-          success: true, 
-          message: `The secret key was successfully extracted! Stole ${transferResult.stolen_coins} coins.`,
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: isPveTarget
+            ? 'The secret key was successfully extracted.'
+            : `The secret key was successfully extracted! Stole ${transferResult?.stolen_coins ?? 0} coins.`,
           log: 'System breached. Key accepted.',
-          stolen_coins: transferResult.stolen_coins,
-          defender_eliminated: transferResult.defender_eliminated
+          stolen_coins: transferResult?.stolen_coins ?? 0,
+          defender_eliminated: transferResult?.defender_eliminated ?? false
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
       
@@ -406,7 +631,11 @@ Deno.serve(async (req) => {
 
     let transferResult: any = null
 
-    if (isSuccessful) {
+    if (challenges.type === 'secret-key' && configuredSecretKey && openAiResponse.toLowerCase().includes(configuredSecretKey.toLowerCase())) {
+      isSuccessful = true
+    }
+
+    if (isSuccessful && !isPveTarget) {
       transferResult = await applyCoinSteal(
         supabaseAdmin,
         attackerTeamId,
@@ -437,6 +666,7 @@ Deno.serve(async (req) => {
 
     await supabaseAdmin.from('attacks').insert({
           defended_challenge_id,
+          challenge_id: isPveTarget ? challenge_id : null,
           attacker_user_id,
           attacker_team_id: attackerTeamId,
           is_successful: isSuccessful,
@@ -448,13 +678,16 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ 
       success: isSuccessful,
       message: isSuccessful
-        ? `Victory condition met. Stole ${transferResult?.stolen_coins ?? 0} coins.`
+        ? isPveTarget
+          ? 'Victory condition met.'
+          : `Victory condition met. Stole ${transferResult?.stolen_coins ?? 0} coins.`
         : 'Prompt evaluated by the model. Read output below.',
       log: `Model Output: ${openAiResponse}`,
       assistant: openAiResponse,
       tool_calls: calledTools,
       stolen_coins: transferResult?.stolen_coins ?? 0,
-      defender_eliminated: transferResult?.defender_eliminated ?? false
+      defender_eliminated: transferResult?.defender_eliminated ?? false,
+      challenge_id: isPveTarget ? challenge_id : null
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     
   } catch (error: any) {

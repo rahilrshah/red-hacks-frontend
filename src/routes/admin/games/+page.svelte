@@ -1,17 +1,34 @@
 <script lang="ts">
+  import { isGameActive } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
+
+  type RoundDraft = {
+    round_index: number;
+    name: string;
+    type: 'pvp' | 'pve';
+    required_defenses: number;
+    duration_minutes: number;
+    intermission_minutes: number;
+    available_challenges: string[];
+  };
 
   let games = $state<any[]>([]);
   let teams = $state<any[]>([]);
   let name = $state('');
   let start_time = $state('');
   let end_time = $state('');
-  let startTimeInput: HTMLInputElement | null = null;
-  let endTimeInput: HTMLInputElement | null = null;
+  let startTimeInput = $state<HTMLInputElement | null>(null);
   let challenges_per_team = $state(5);
   let allChallenges = $state<any[]>([]);
   let selectedChallengeIds = $state<string[]>([]);
+  let roundName = $state('Round 1');
+  let roundType = $state<'pvp' | 'pve'>('pvp');
+  let roundRequiredDefenses = $state(1);
+  let roundDurationMinutes = $state(60);
+  let roundIntermissionMinutes = $state(5);
+  let roundChallengeIds = $state<string[]>([]);
+  let roundDrafts = $state<RoundDraft[]>([]);
   let loading = $state(false);
   let errorMsg = $state('');
   let selectedGameId = $state('');
@@ -23,6 +40,8 @@
   let challengeEditorLoading = $state(false);
   let challengeEditorMessage = $state('');
   let challengeEditorError = $state(false);
+  let draftScheduleSummary = $derived(validateScheduleFit(roundDrafts));
+  let draftTimelineItems = $derived(buildDraftTimeline(roundDrafts));
 
   onMount(async () => {
     await fetchChallenges();
@@ -33,12 +52,229 @@
     return allChallenges.map((challenge) => challenge.id);
   }
 
+  function resetRoundDraftFields() {
+    roundName = `Round ${roundDrafts.length + 1}`;
+    roundType = 'pvp';
+    roundRequiredDefenses = challenges_per_team;
+    roundDurationMinutes = 60;
+    roundIntermissionMinutes = 5;
+    roundChallengeIds = allChallengeIds();
+  }
+
   function toggleChallengeSelection(challengeId: string) {
     if (selectedChallengeIds.includes(challengeId)) {
       selectedChallengeIds = selectedChallengeIds.filter((id) => id !== challengeId);
     } else {
       selectedChallengeIds = [...selectedChallengeIds, challengeId];
     }
+  }
+
+  function toggleRoundChallengeSelection(challengeId: string) {
+    if (roundChallengeIds.includes(challengeId)) {
+      roundChallengeIds = roundChallengeIds.filter((id) => id !== challengeId);
+    } else {
+      roundChallengeIds = [...roundChallengeIds, challengeId];
+    }
+  }
+
+  function computeGameWindowMinutes(startIsoLike: string, endIsoLike: string): number | null {
+    if (!startIsoLike || !endIsoLike) {
+      return null;
+    }
+
+    const startMs = new Date(startIsoLike).getTime();
+    const endMs = new Date(endIsoLike).getTime();
+    if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) {
+      return null;
+    }
+
+    return Math.floor((endMs - startMs) / 60000);
+  }
+
+  function computePlannedRoundMinutes(rounds: RoundDraft[]) {
+    return rounds.reduce((total, round) => {
+      const duration = Math.max(1, Math.trunc(Number(round.duration_minutes) || 0));
+      const intermission = Math.max(0, Math.trunc(Number(round.intermission_minutes) || 0));
+      return total + duration + intermission;
+    }, 0);
+  }
+
+  function toDateTimeLocalString(epochMs: number) {
+    const date = new Date(epochMs);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${year}-${month}-${day}T${hours}:${minutes}`;
+  }
+
+  function computeRoundsBasedEndTime(startIsoLike: string, rounds: RoundDraft[]): string | null {
+    if (!startIsoLike || rounds.length === 0) {
+      return null;
+    }
+
+    const startMs = new Date(startIsoLike).getTime();
+    if (Number.isNaN(startMs)) {
+      return null;
+    }
+
+    const plannedMinutes = computePlannedRoundMinutes(rounds);
+    const endMs = startMs + plannedMinutes * 60000;
+    return toDateTimeLocalString(endMs);
+  }
+
+  function effectiveEndTimeForValidation(rounds: RoundDraft[]) {
+    return computeRoundsBasedEndTime(start_time, rounds) ?? end_time;
+  }
+
+  function validateScheduleFit(rounds: RoundDraft[]) {
+    const availableMinutes = computeGameWindowMinutes(start_time, effectiveEndTimeForValidation(rounds));
+    const plannedMinutes = computePlannedRoundMinutes(rounds);
+
+    if (availableMinutes === null) {
+      return {
+        ok: true,
+        availableMinutes,
+        plannedMinutes,
+        message: ''
+      };
+    }
+
+    if (plannedMinutes > availableMinutes) {
+      return {
+        ok: false,
+        availableMinutes,
+        plannedMinutes,
+        message: `Round schedule exceeds game window by ${plannedMinutes - availableMinutes} minute(s).`
+      };
+    }
+
+    return {
+      ok: true,
+      availableMinutes,
+      plannedMinutes,
+      message: ''
+    };
+  }
+
+  function buildDraftTimeline(rounds: RoundDraft[]) {
+    if (!start_time) {
+      return [] as Array<{ label: string; startLabel: string; endLabel: string; type: 'round' | 'intermission' }>;
+    }
+
+    const startMs = new Date(start_time).getTime();
+    if (Number.isNaN(startMs)) {
+      return [] as Array<{ label: string; startLabel: string; endLabel: string; type: 'round' | 'intermission' }>;
+    }
+
+    let cursorMs = startMs;
+    const items: Array<{ label: string; startLabel: string; endLabel: string; type: 'round' | 'intermission' }> = [];
+
+    for (const round of rounds) {
+      const durationMinutes = Math.max(1, Math.trunc(Number(round.duration_minutes) || 0));
+      const intermissionMinutes = Math.max(0, Math.trunc(Number(round.intermission_minutes) || 0));
+
+      const roundStartMs = cursorMs;
+      const roundEndMs = roundStartMs + durationMinutes * 60000;
+
+      items.push({
+        label: `Round ${round.round_index + 1}: ${round.name}`,
+        startLabel: new Date(roundStartMs).toLocaleString(),
+        endLabel: new Date(roundEndMs).toLocaleString(),
+        type: 'round'
+      });
+
+      if (intermissionMinutes > 0) {
+        const intermissionEndMs = roundEndMs + intermissionMinutes * 60000;
+        items.push({
+          label: `Intermission (${intermissionMinutes}m)`,
+          startLabel: new Date(roundEndMs).toLocaleString(),
+          endLabel: new Date(intermissionEndMs).toLocaleString(),
+          type: 'intermission'
+        });
+        cursorMs = intermissionEndMs;
+      } else {
+        cursorMs = roundEndMs;
+      }
+    }
+
+    return items;
+  }
+
+  function addRoundDraft() {
+    const trimmedName = roundName.trim();
+    const normalizedRequiredDefenses = Number(roundRequiredDefenses);
+    const normalizedDuration = Number(roundDurationMinutes);
+    const normalizedIntermission = Number(roundIntermissionMinutes);
+
+    if (!trimmedName) {
+      errorMsg = 'Round name cannot be empty.';
+      return;
+    }
+
+    if (!Number.isInteger(normalizedRequiredDefenses) || normalizedRequiredDefenses <= 0) {
+      errorMsg = 'Required defenses must be a positive whole number.';
+      return;
+    }
+
+    if (normalizedRequiredDefenses > roundChallengeIds.length) {
+      errorMsg = 'Required defenses cannot be greater than the number of selected round challenges.';
+      return;
+    }
+
+    if (!Number.isInteger(normalizedDuration) || normalizedDuration <= 0) {
+      errorMsg = 'Duration must be a positive whole number of minutes.';
+      return;
+    }
+
+    if (!Number.isInteger(normalizedIntermission) || normalizedIntermission < 0) {
+      errorMsg = 'Intermission must be a non-negative whole number of minutes.';
+      return;
+    }
+
+    if (roundChallengeIds.length === 0) {
+      errorMsg = 'Select at least one challenge for this round.';
+      return;
+    }
+
+    const nextDrafts: RoundDraft[] = [
+      ...roundDrafts,
+      {
+        round_index: roundDrafts.length,
+        name: trimmedName,
+        type: roundType,
+        required_defenses: normalizedRequiredDefenses,
+        duration_minutes: normalizedDuration,
+        intermission_minutes: normalizedIntermission,
+        available_challenges: Array.from(new Set(roundChallengeIds))
+      }
+    ];
+
+    const scheduleCheck = validateScheduleFit(nextDrafts);
+    if (!scheduleCheck.ok) {
+      errorMsg = scheduleCheck.message;
+      return;
+    }
+
+    roundDrafts = nextDrafts;
+
+    errorMsg = '';
+    resetRoundDraftFields();
+  }
+
+  function removeRoundDraft(roundIndex: number) {
+    roundDrafts = roundDrafts
+      .filter((draft) => draft.round_index !== roundIndex)
+      .map((draft, index) => ({
+        ...draft,
+        round_index: index
+      }));
+  }
+
+  function clearRoundDrafts() {
+    roundDrafts = [];
+    resetRoundDraftFields();
   }
 
   function toggleEditorChallengeSelection(challengeId: string) {
@@ -64,6 +300,14 @@
 
     if (selectedChallengeIds.length === 0) {
       selectedChallengeIds = allChallengeIds();
+    }
+
+    if (roundChallengeIds.length === 0) {
+      roundChallengeIds = allChallengeIds();
+    }
+
+    if (roundDrafts.length === 0) {
+      resetRoundDraftFields();
     }
   }
 
@@ -91,6 +335,55 @@
     const { error: insertError } = await supabase
       .from('game_challenges')
       .insert(rows);
+
+    if (insertError) {
+      throw insertError;
+    }
+  }
+
+  async function replaceGameRounds(
+    gameId: string,
+    roundsToSave: Array<{ round_index: number; name: string; type: 'pvp' | 'pve'; required_defenses: number; duration_minutes: number; intermission_minutes: number; available_challenges: string[] }>
+  ) {
+    const normalizedRounds = roundsToSave
+      .map((round, index) => ({
+        round_index: index,
+        name: round.name.trim(),
+        type: round.type,
+        required_defenses: Math.max(1, Math.trunc(round.required_defenses)),
+        duration_minutes: Math.max(1, Math.trunc(round.duration_minutes)),
+        intermission_minutes: Math.max(0, Math.trunc(round.intermission_minutes)),
+        available_challenges: Array.from(new Set(round.available_challenges))
+      }))
+      .filter((round) => round.name.length > 0);
+
+    const { error: deleteError } = await supabase
+      .from('rounds')
+      .delete()
+      .eq('game_id', gameId);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+
+    if (normalizedRounds.length === 0) {
+      return;
+    }
+
+    const { error: insertError } = await supabase
+      .from('rounds')
+      .insert(
+        normalizedRounds.map((round) => ({
+          game_id: gameId,
+          round_index: round.round_index,
+          name: round.name,
+          type: round.type,
+          required_defenses: round.required_defenses,
+          duration_minutes: round.duration_minutes,
+          intermission_minutes: round.intermission_minutes,
+          available_challenges: round.available_challenges
+        }))
+      );
 
     if (insertError) {
       throw insertError;
@@ -364,42 +657,64 @@
     });
   }
 
-  function isGameActive(game: { is_active: boolean; start_time: string; end_time: string }) {
-    const now = Date.now();
-    const start = new Date(game.start_time).getTime();
-    const end = new Date(game.end_time).getTime();
-    return Boolean(game.is_active) && !Number.isNaN(start) && !Number.isNaN(end) && now >= start && now <= end;
-  }
-
   async function createGame() {
     loading = true;
     errorMsg = '';
 
-    if (selectedChallengeIds.length === 0) {
+    const challengePool = Array.from(
+      new Set([
+        ...selectedChallengeIds,
+        ...roundDrafts.flatMap((round) => round.available_challenges)
+      ])
+    );
+
+    if (challengePool.length === 0) {
       errorMsg = 'Select at least one challenge for this game.';
       loading = false;
       return;
     }
 
+    const roundsToSave: RoundDraft[] = roundDrafts.length > 0
+      ? roundDrafts
+      : [
+          {
+            round_index: 0,
+            name: 'Round 1',
+            type: 'pvp',
+            required_defenses: challenges_per_team,
+            duration_minutes: 60,
+            intermission_minutes: 5,
+            available_challenges: challengePool
+          }
+        ];
+
     const dateTimeLocalPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
-    if (!dateTimeLocalPattern.test(start_time) || !dateTimeLocalPattern.test(end_time)) {
+    const proposedEndTime = effectiveEndTimeForValidation(roundsToSave);
+    if (!dateTimeLocalPattern.test(start_time) || !proposedEndTime || !dateTimeLocalPattern.test(proposedEndTime)) {
       errorMsg = 'Please select valid start and end date/time values.';
       loading = false;
       return;
     }
 
     // datetime-local uses a sortable format: YYYY-MM-DDTHH:mm
-    if (end_time <= start_time) {
+    if (proposedEndTime <= start_time) {
       errorMsg = 'End time must be after start time.';
       loading = false;
       return;
     }
-    
+
+    const scheduleCheck = validateScheduleFit(roundsToSave);
+    if (!scheduleCheck.ok) {
+      errorMsg = scheduleCheck.message;
+      loading = false;
+      return;
+    }
+
     const { data: user } = await supabase.auth.getUser();
     const invite_code = generateInviteCode();
     const now = Date.now();
     const startDate = new Date(start_time);
-    const endDate = new Date(end_time);
+    const endDate = new Date(proposedEndTime);
     const startMs = startDate.getTime();
     const endMs = endDate.getTime();
 
@@ -431,9 +746,13 @@
       errorMsg = error.message;
     } else {
       try {
-        await replaceGameChallenges(createdGame.id, selectedChallengeIds);
+        await replaceGameChallenges(createdGame.id, challengePool);
+        await replaceGameRounds(
+          createdGame.id,
+          roundsToSave
+        );
       } catch (challengeError: any) {
-        errorMsg = `Game created, but challenge mapping failed: ${challengeError.message}`;
+        errorMsg = `Game created, but round or challenge mapping failed: ${challengeError.message}`;
         loading = false;
         await fetchGames();
         return;
@@ -444,6 +763,7 @@
       end_time = '';
       challenges_per_team = 5;
       selectedChallengeIds = allChallengeIds();
+      clearRoundDrafts();
       await fetchGames();
     }
     
@@ -477,7 +797,18 @@
       <div class="space-y-2 col-span-2 md:col-span-1">
         <p class="text-sm font-medium text-gray-300">Start Time</p>
         <div class="flex gap-2">
-          <input id="game-start-time" bind:this={startTimeInput} type="datetime-local" bind:value={start_time} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+          <input
+            id="game-start-time"
+            bind:this={startTimeInput}
+            type="datetime-local"
+            step="60"
+            value={start_time}
+            onchange={(event) => {
+              const input = event.currentTarget as HTMLInputElement;
+              start_time = input.value;
+            }}
+            class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all"
+          />
           <button
             type="button"
             class="shrink-0 px-3 rounded-md border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors"
@@ -487,25 +818,26 @@
             Pick
           </button>
         </div>
+        <p class="text-xs text-gray-500">Select the game start. Round schedule will build from this time.</p>
       </div>
       <div class="space-y-2 col-span-2 md:col-span-1">
-        <p class="text-sm font-medium text-gray-300">End Time</p>
-        <div class="flex gap-2">
-          <input id="game-end-time" bind:this={endTimeInput} type="datetime-local" bind:value={end_time} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
-          <button
-            type="button"
-            class="shrink-0 px-3 rounded-md border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors"
-            onclick={() => endTimeInput?.showPicker?.()}
-            aria-label="Open end time calendar"
-          >
-            Pick
-          </button>
-        </div>
+        <p class="text-sm font-medium text-gray-300">End Time {roundDrafts.length > 0 ? '(Auto from Rounds)' : ''}</p>
+        {#if roundDrafts.length > 0}
+          <div class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white/90 font-mono" aria-live="polite">
+            {computeRoundsBasedEndTime(start_time, roundDrafts) ?? 'Set start time to calculate end time'}
+          </div>
+        {:else}
+          <input id="game-end-time" type="datetime-local" step="60" bind:value={end_time} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+        {/if}
+        {#if roundDrafts.length > 0}
+          <p class="text-xs text-gray-500">End time is calculated from the round schedule.</p>
+        {/if}
       </div>
 
       <div class="space-y-2 col-span-2 md:col-span-1">
-        <p class="text-sm font-medium text-gray-300">Challenges Per Team</p>
+        <p class="text-sm font-medium text-gray-300">Default Defenses Per Round</p>
         <input id="game-challenges-per-team" type="number" bind:value={challenges_per_team} min="1" max="20" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+        <p class="text-xs text-gray-500">This value becomes the default round defense count when you add a round.</p>
       </div>
 
       <div class="space-y-3 col-span-2">
@@ -555,9 +887,147 @@
 
         <p class="text-xs text-gray-500">Selected: {selectedChallengeIds.length} / {allChallenges.length}. New games default to all challenges selected.</p>
       </div>
+
+      <div class="space-y-4 col-span-2 border border-white/10 rounded-xl bg-black/20 p-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <p class="text-sm font-medium text-gray-300">Rounds</p>
+            <p class="text-xs text-gray-500">Add one or more rounds for this game before creating it.</p>
+          </div>
+          <button
+            type="button"
+            class="px-2.5 py-1 rounded border border-white/15 text-xs text-gray-200 hover:bg-white/10"
+            onclick={clearRoundDrafts}
+          >
+            Clear rounds
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-2 col-span-2 md:col-span-1">
+            <p class="text-sm font-medium text-gray-300">Round Name</p>
+            <input bind:value={roundName} placeholder="Round 1" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+          </div>
+
+          <div class="space-y-2 col-span-2 md:col-span-1">
+            <p class="text-sm font-medium text-gray-300">Round Type</p>
+            <select bind:value={roundType} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all">
+              <option value="pvp">PvP</option>
+              <option value="pve">PvE</option>
+            </select>
+          </div>
+
+          <div class="space-y-2 col-span-2 md:col-span-1">
+            <p class="text-sm font-medium text-gray-300">Required Defenses</p>
+            <input bind:value={roundRequiredDefenses} type="number" min="1" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+            <p class="text-xs text-gray-500">Teams must defend this many challenges in this round.</p>
+          </div>
+
+          <div class="space-y-2 col-span-2 md:col-span-1">
+            <p class="text-sm font-medium text-gray-300">Round Duration (minutes)</p>
+            <input bind:value={roundDurationMinutes} type="number" min="1" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+            <p class="text-xs text-gray-500">How long this round lasts.</p>
+          </div>
+
+          <div class="space-y-2 col-span-2 md:col-span-1">
+            <p class="text-sm font-medium text-gray-300">Intermission (minutes)</p>
+            <input bind:value={roundIntermissionMinutes} type="number" min="0" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+            <p class="text-xs text-gray-500">Break time after this round ends.</p>
+          </div>
+
+          <div class="space-y-2 col-span-2">
+            <p class="text-sm font-medium text-gray-300">Round Challenges</p>
+            {#if allChallenges.length === 0}
+              <div class="text-sm text-gray-500 border border-white/10 rounded-lg p-3 bg-black/20">No challenges exist yet.</div>
+            {:else}
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-3 border border-white/10 rounded-lg bg-black/30">
+                {#each allChallenges as challenge}
+                  <label class="flex items-start gap-3 p-2 rounded hover:bg-white/5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={roundChallengeIds.includes(challenge.id)}
+                      onchange={() => toggleRoundChallengeSelection(challenge.id)}
+                      class="mt-0.5"
+                    />
+                    <span class="text-sm text-gray-200">
+                      <span class="font-semibold text-white">{challenge.model_name}</span>
+                      <span class="text-xs text-gray-400 ml-2">{challenge.type}</span>
+                      <span class="block text-xs text-gray-500 mt-0.5">{challenge.description}</span>
+                    </span>
+                  </label>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <p class="text-xs text-gray-500">Round draft uses {roundChallengeIds.length} challenge(s) and requires {roundRequiredDefenses} defense(s).</p>
+          <button
+            type="button"
+            class="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-semibold"
+            onclick={addRoundDraft}
+            disabled={allChallenges.length === 0}
+          >
+            Add Round
+          </button>
+        </div>
+
+        {#if roundDrafts.length > 0}
+          <div class="space-y-3 border-t border-white/10 pt-4">
+            <p class="text-sm font-medium text-gray-300">Draft Rounds</p>
+            <div class="space-y-2">
+              {#each roundDrafts as round}
+                <div class="flex items-center justify-between gap-3 rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                  <div>
+                    <p class="font-semibold text-white">{round.round_index + 1}. {round.name}</p>
+                    <p class="text-xs text-gray-500 uppercase tracking-wider">{round.type} • {round.available_challenges.length} challenge(s) • {round.required_defenses} required defense(s)</p>
+                    <p class="text-xs text-gray-400 mt-1">{round.duration_minutes}m round • {round.intermission_minutes}m break</p>
+                  </div>
+                  <button
+                    type="button"
+                    class="px-2.5 py-1 rounded border border-red-500/30 text-xs text-red-300 hover:bg-red-500/10"
+                    onclick={() => removeRoundDraft(round.round_index)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              {/each}
+            </div>
+
+            <div class="rounded-lg border border-white/10 bg-black/30 p-3 text-xs text-gray-300 space-y-1">
+              <p>Planned timeline: <span class="font-semibold text-white">{draftScheduleSummary.plannedMinutes} min</span></p>
+              {#if draftScheduleSummary.availableMinutes !== null}
+                <p>Available game window: <span class="font-semibold text-white">{draftScheduleSummary.availableMinutes} min</span></p>
+                <p class={draftScheduleSummary.ok ? 'text-emerald-300' : 'text-red-300'}>
+                  {draftScheduleSummary.ok
+                    ? `Fits with ${draftScheduleSummary.availableMinutes - draftScheduleSummary.plannedMinutes} min spare.`
+                    : draftScheduleSummary.message}
+                </p>
+              {:else}
+                <p class="text-amber-300">Set valid start and end times to validate schedule fit.</p>
+              {/if}
+            </div>
+
+            {#if start_time}
+              {#if draftTimelineItems.length > 0}
+                <div class="rounded-lg border border-white/10 bg-slate-950/60 p-3 space-y-2">
+                  <p class="text-xs uppercase tracking-wider text-gray-400">Timeline Preview</p>
+                  {#each draftTimelineItems as item}
+                    <div class="text-xs rounded border p-2 {item.type === 'round' ? 'border-blue-500/30 bg-blue-500/10 text-blue-200' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}">
+                      <p class="font-semibold">{item.label}</p>
+                      <p class="opacity-80">{item.startLabel} → {item.endLabel}</p>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+      </div>
     </div>
 
-    <button onclick={createGame} disabled={loading || !name || !start_time || !end_time || selectedChallengeIds.length === 0 || allChallenges.length === 0} class="w-full bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 mt-6 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
+    <button onclick={createGame} disabled={loading || !name || !start_time || (!end_time && roundDrafts.length === 0) || (selectedChallengeIds.length === 0 && roundDrafts.length === 0) || allChallenges.length === 0} class="w-full bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-bold disabled:opacity-50 mt-6 transition-all shadow-lg hover:shadow-red-500/20 active:scale-[0.98]">
       {loading ? 'Creating...' : 'Create Game'}
     </button>
   </div>

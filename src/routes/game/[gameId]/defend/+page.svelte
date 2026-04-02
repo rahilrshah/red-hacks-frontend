@@ -1,9 +1,11 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
-  let gameId = $derived($page.params.gameId);
+  let gameId = $derived($page.params.gameId ?? '');
+  let roundInfo = $state<any>(null);
   let challenges = $state<any[]>([]);
   let defended = $state<any[]>([]);
   let loading = $state(true);
@@ -17,6 +19,55 @@
   async function loadPage() {
     loading = true;
     statusError = '';
+
+    const { data: gameData, error: gameError } = await supabase
+      .from('games')
+      .select('is_active, start_time, end_time')
+      .eq('id', gameId)
+      .maybeSingle();
+
+    if (gameError) {
+      statusError = gameError.message;
+      loading = false;
+      return;
+    }
+
+    if (!gameData || !isGameActive(gameData)) {
+      statusError = 'This game is not currently active.';
+      loading = false;
+      return;
+    }
+
+    try {
+      const runtimeContext = await loadRoundRuntimeContext(supabase, gameId);
+      roundInfo = runtimeContext.currentRound;
+
+      if (runtimeContext.phase === 'intermission') {
+        statusError = 'Round intermission is active. Defense updates are paused until the next round.';
+        loading = false;
+        return;
+      }
+
+      if (runtimeContext.phase !== 'round-active' || !roundInfo) {
+        statusError = 'There is no active round to configure defenses right now.';
+        loading = false;
+        return;
+      }
+    } catch (error: any) {
+      statusError = error?.message || 'Could not load the active round.';
+      loading = false;
+      return;
+    }
+
+    let allowedChallengeIds: string[] = [];
+
+    try {
+      allowedChallengeIds = await loadRoundChallengeIds(supabase, gameId, roundInfo);
+    } catch (error: any) {
+      statusError = error?.message || 'Could not resolve the current round challenges.';
+      loading = false;
+      return;
+    }
 
     const { data: userData } = await supabase.auth.getUser();
     if (!userData.user) {
@@ -40,7 +91,7 @@
 
     teamId = member.team_id;
 
-    const [{ data: gameChallengeRows }, { data: defendedRows }] = await Promise.all([
+    const [{ data: gameChallengeRows, error: challengeListError }, { data: defendedRows, error: defendedListError }] = await Promise.all([
       supabase
         .from('game_challenges')
         .select('challenge_id, challenges!inner(id, model_name, description, type, defense_reward_coins, attack_steal_coins, created_at)')
@@ -51,9 +102,22 @@
         .eq('team_id', teamId)
     ]);
 
+    if (challengeListError) {
+      statusError = challengeListError.message;
+      loading = false;
+      return;
+    }
+
+    if (defendedListError) {
+      statusError = defendedListError.message;
+      loading = false;
+      return;
+    }
+
     challenges = (gameChallengeRows ?? [])
       .map((row: any) => row.challenges)
       .filter((row: any) => !!row)
+      .filter((row: any) => allowedChallengeIds.includes(row.id))
       .sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
     defended = defendedRows ?? [];
 
@@ -65,6 +129,12 @@
   <div class="border-b border-white/10 pb-6">
     <h1 class="text-4xl font-black tracking-tight text-white mb-2">Blue Team: Defense Console</h1>
     <p class="text-gray-400 text-lg">Choose a challenge to open its dedicated defense options page.</p>
+    {#if roundInfo}
+      <p class="text-xs text-gray-500 mt-2">Round: {roundInfo.name} • {roundInfo.type.toUpperCase()}</p>
+    {/if}
+    {#if roundInfo?.type === 'pve'}
+      <p class="text-xs text-amber-300 mt-2">This round uses the challenge default prompt as the defense. Team-specific setup is limited.</p>
+    {/if}
   </div>
 
   {#if loading}

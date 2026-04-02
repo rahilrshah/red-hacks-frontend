@@ -1,16 +1,19 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
-  let gameId = $derived($page.params.gameId);
+  let gameId = $derived($page.params.gameId ?? '');
   let gameName = $state('');
+  let roundInfo = $state<any>(null);
   let challenges = $state<any[]>([]);
   let selectedChallengeId = $state('');
   let initialAttackPrompt = $state('');
   let loading = $state(false);
   let statusError = $state('');
+  let attackMode = $derived(resolveRoundType(roundInfo));
 
   onMount(async () => {
     statusError = '';
@@ -18,7 +21,7 @@
     try {
       const { data: gameData, error: gameError } = await supabase
         .from('games')
-        .select('name')
+        .select('name, is_active, start_time, end_time')
         .eq('id', gameId)
         .maybeSingle();
 
@@ -28,8 +31,31 @@
       }
 
       gameName = gameData?.name ?? '';
+      if (!gameData || !isGameActive(gameData)) {
+        statusError = 'This game is not currently active.';
+        return;
+      }
 
-      // Resolve viewer's team for this game so we can hide self-targets.
+      const runtimeContext = await loadRoundRuntimeContext(supabase, gameId);
+      roundInfo = runtimeContext.currentRound;
+
+      if (runtimeContext.phase === 'intermission') {
+        statusError = 'Round intermission is active. Attacks are paused until the next round starts.';
+        return;
+      }
+
+      if (runtimeContext.phase !== 'round-active' || !roundInfo) {
+        statusError = 'There is no active round to attack right now.';
+        return;
+      }
+
+      const allowedChallengeIds = await loadRoundChallengeIds(supabase, gameId, roundInfo);
+
+      if (allowedChallengeIds.length === 0) {
+        challenges = [];
+        return;
+      }
+
       const { data: userData, error: userError } = await supabase.auth.getUser();
       if (userError) {
         statusError = userError.message;
@@ -39,7 +65,7 @@
       const userId = userData?.user?.id;
 
       let myTeamId: string | null = null;
-      if (userId) {
+      if (userId && resolveRoundType(roundInfo) === 'pvp') {
         const { data: membership, error: membershipError } = await supabase
           .from('team_members')
           .select('team_id, teams!inner(game_id)')
@@ -54,44 +80,67 @@
         }
 
         myTeamId = membership?.team_id ?? null;
+
+        const requiredDefenses = Math.max(0, Math.trunc(roundInfo?.required_defenses ?? 0));
+        if (myTeamId && requiredDefenses > 0) {
+          const { count: defendedCount, error: defendedCountError } = await supabase
+            .from('defended_challenges')
+            .select('id', { count: 'exact', head: true })
+            .eq('team_id', myTeamId)
+            .eq('is_active', true)
+            .in('challenge_id', allowedChallengeIds);
+
+          if (defendedCountError) {
+            statusError = defendedCountError.message;
+            return;
+          }
+
+          if ((defendedCount ?? 0) < requiredDefenses) {
+            statusError = `Attack locked: defend at least ${requiredDefenses} prompt(s) this round before attacking (${defendedCount ?? 0}/${requiredDefenses} configured).`;
+            return;
+          }
+        }
       }
 
-      if (!myTeamId) {
-        statusError = 'Could not determine your team for this game, so opponent targets cannot be resolved.';
-        return;
+      if (resolveRoundType(roundInfo) === 'pvp') {
+        if (!myTeamId) {
+          statusError = 'Could not determine your team for this game, so opponent targets cannot be resolved.';
+          return;
+        }
+
+        const { data, error } = await supabase
+          .from('defended_challenges')
+          .select('id, team_id, is_active, teams!inner(name, game_id, coins), challenges(*)')
+          .eq('teams.game_id', gameId)
+          .in('challenge_id', allowedChallengeIds)
+          .gt('teams.coins', 0)
+          .neq('team_id', myTeamId);
+
+        if (error) {
+          statusError = error.message;
+          return;
+        }
+
+        challenges = (data ?? []).sort((a: any, b: any) => Number(b.is_active) - Number(a.is_active));
+      } else {
+        const { data, error } = await supabase
+          .from('challenges')
+          .select('id, description, type, model_name, attack_steal_coins, default_prompt, *')
+          .in('id', allowedChallengeIds);
+
+        if (error) {
+          statusError = error.message;
+          return;
+        }
+
+        challenges = (data ?? []).map((challenge: any) => ({
+          id: challenge.id,
+          team_id: null,
+          is_active: true,
+          teams: { name: roundInfo?.name ?? 'Default Defense', game_id: gameId, coins: 0 },
+          challenges: challenge
+        }));
       }
-
-      const { data: gameChallengeRows, error: gameChallengeError } = await supabase
-        .from('game_challenges')
-        .select('challenge_id')
-        .eq('game_id', gameId);
-
-      if (gameChallengeError) {
-        statusError = gameChallengeError.message;
-        return;
-      }
-
-      const allowedChallengeIds = (gameChallengeRows ?? []).map((row: any) => row.challenge_id);
-      if (allowedChallengeIds.length === 0) {
-        challenges = [];
-        return;
-      }
-
-      // Fetch all defended challenges in this game and hide self-targets.
-      const { data, error } = await supabase
-        .from('defended_challenges')
-        .select('id, team_id, is_active, teams!inner(name, game_id, coins), challenges(id, description, type, model_name, attack_steal_coins)')
-        .eq('teams.game_id', gameId)
-        .in('challenge_id', allowedChallengeIds)
-        .gt('teams.coins', 0) // Only show targets that have coins to steal
-        .neq('team_id', myTeamId);
-
-      if (error) {
-        statusError = error.message;
-        return;
-      }
-
-      challenges = (data ?? []).sort((a: any, b: any) => Number(b.is_active) - Number(a.is_active));
 
       if (challenges.length > 0) {
         selectedChallengeId = challenges[0].id;
@@ -125,7 +174,10 @@
     {#if gameName}
       <p class="text-gray-300 text-sm mb-2">Game: <span class="font-semibold text-white">{gameName}</span></p>
     {/if}
-    <p class="text-gray-400 text-lg">Select an opponent's defended challenge to attack. Bypass their system prompt to extract the secret key or trigger the forbidden tool!</p>
+    {#if roundInfo}
+      <p class="text-gray-400 text-sm mb-2">Round: <span class="font-semibold text-white">{roundInfo.name}</span> • Type: <span class="font-semibold text-white uppercase">{roundInfo.type}</span></p>
+    {/if}
+    <p class="text-gray-400 text-lg">{attackMode === 'pvp' ? "Select an opponent's defended challenge to attack." : 'Select a challenge from this round and attack the default defense.'}</p>
   </div>
 
   {#if statusError}
@@ -133,7 +185,7 @@
   {/if}
   
   <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-    <div class="col-span-1 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl overflow-hidden h-[600px] flex flex-col shadow-xl">
+    <div class="col-span-1 border border-white/10 bg-slate-900/50 backdrop-blur-md rounded-xl overflow-hidden h-150 flex flex-col shadow-xl">
       <div class="p-4 border-b border-white/10 bg-black/40 top-0 sticky z-10">
         <h2 class="text-xs font-bold text-gray-400 tracking-widest uppercase">Available Targets</h2>
       </div>
@@ -143,16 +195,16 @@
             class="w-full text-left p-5 hover:bg-slate-800/80 transition-all block group {selectedChallengeId === target.id ? 'bg-red-500/10 border-l-4 border-red-500' : 'border-l-4 border-transparent'}"
             onclick={() => selectedChallengeId = target.id}
           >
-            <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors">{target.teams?.name}</div>
+            <div class="font-bold text-white mb-1 group-hover:text-red-300 transition-colors">{target.teams?.name || 'Default Defense'}</div>
             <div class="text-xs text-gray-400 mb-3 truncate font-mono">{target.challenges?.model_name} • {target.challenges?.type}</div>
             <div class="text-xs mb-2 {target.is_active ? 'text-emerald-300' : 'text-amber-300'}">{target.is_active ? 'Active Defense' : 'Inactive Defense'}</div>
-            <div class="text-xs text-gray-300">Team Coins: {target.teams?.coins ?? 0}</div>
+            <div class="text-xs text-gray-300">{attackMode === 'pvp' ? `Team Coins: ${target.teams?.coins ?? 0}` : 'Default prompt target'}</div>
             <div class="text-xs text-gray-500 mt-1">Steal on success: {target.challenges?.attack_steal_coins ?? 0}</div>
           </button>
         {/each}
         {#if challenges.length === 0}
           <div class="p-5 text-sm text-gray-500">
-            No opponent defended challenges were found for this game yet.
+            {attackMode === 'pvp' ? 'No opponent defended challenges were found for this game yet.' : 'No round challenges are available for this game yet.'}
           </div>
         {/if}
       </div>
@@ -166,13 +218,16 @@
         <div class="mb-6 pb-6 border-b border-white/10 relative z-10">
           <div class="flex justify-between items-start">
             <div>
-              <h2 class="text-2xl font-bold text-white mb-2">Targeting: <span class="text-red-400">{selected.teams?.name}</span></h2>
+              <h2 class="text-2xl font-bold text-white mb-2">Targeting: <span class="text-red-400">{selected.teams?.name || 'Default Defense'}</span></h2>
               <p class="text-sm text-gray-400 leading-relaxed max-w-xl">{selected.challenges?.description}</p>
             </div>
             <span class="px-3 py-1 bg-black/40 border border-white/10 rounded-full text-xs font-mono text-gray-300">
               {selected.challenges?.model_name}
             </span>
           </div>
+          {#if selected.challenges?.challenge_url}
+            <p class="mt-3 text-xs text-emerald-300 break-all">Direct backend: {selected.challenges.challenge_url}</p>
+          {/if}
         </div>
 
         <div class="flex-1 space-y-6 relative z-10">

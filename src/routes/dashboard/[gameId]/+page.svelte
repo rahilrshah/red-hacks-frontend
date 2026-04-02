@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isGameActive } from '$lib/gameplay';
   import { page } from '$app/stores';
   import { supabase } from '$lib/supabaseClient';
   import { onMount, onDestroy } from 'svelte';
@@ -9,13 +10,6 @@
   let players = $state<any[]>([]);
   let recentAttacks = $state<any[]>([]);
   let loading = $state(true);
-
-  function isGameActive(gameData: { is_active: boolean; start_time: string; end_time: string }) {
-    const now = Date.now();
-    const start = new Date(gameData.start_time).getTime();
-    const end = new Date(gameData.end_time).getTime();
-    return Boolean(gameData.is_active) && !Number.isNaN(start) && !Number.isNaN(end) && now >= start && now <= end;
-  }
 
   onMount(async () => {
     await fetchDashboardData();

@@ -109,7 +109,8 @@ await supabase.auth.signOut();
 <span class="text-red-500">⚡</span> RedHacks
 </a>
 <nav class="ml-auto flex items-center space-x-6 text-sm font-semibold text-gray-300">
-<a href="/play" class="hover:text-white transition-colors">Player Hub</a>
+<a href="/play" class="hover:text-white transition-colors">Join a Game</a>
+<a href="/play/current-games" class="hover:text-white transition-colors">Current Games</a>
 {#if user && !user.is_anonymous}
 <a href="/profile" class="hover:text-white transition-colors">Profile</a>
 {/if}

@@ -13,6 +13,7 @@
   let default_prompt = $state('');
   let context = $state('');
   let type = $state('secret-key');
+  let challenge_url = $state('');
   let target_tool_name = $state('');
   let defense_reward_coins = $state(0);
   let attack_steal_coins = $state(0);
@@ -50,6 +51,7 @@
     default_prompt = '';
     context = '';
     type = 'secret-key';
+    challenge_url = '';
     target_tool_name = '';
     defense_reward_coins = 0;
     attack_steal_coins = 0;
@@ -100,6 +102,7 @@
             default_prompt,
             context,
             type,
+            challenge_url: challenge_url.trim() || null,
             target_tool_name: type === 'tool-calling' ? target_tool_name || null : null,
             defense_reward_coins,
             attack_steal_coins,
@@ -120,6 +123,7 @@
           default_prompt,
           context,
           type,
+          challenge_url: challenge_url.trim() || null,
           target_tool_name: type === 'tool-calling' ? target_tool_name : null,
           defense_reward_coins,
           attack_steal_coins,
@@ -158,6 +162,7 @@
     default_prompt = challenge.default_prompt ?? '';
     context = challenge.context ?? '';
     type = challenge.type ?? 'secret-key';
+    challenge_url = challenge.challenge_url ?? '';
     target_tool_name = challenge.target_tool_name ?? '';
     defense_reward_coins = challenge.defense_reward_coins ?? 0;
     attack_steal_coins = challenge.attack_steal_coins ?? 0;
@@ -232,6 +237,12 @@
       </div>
 
       <div class="space-y-2 col-span-2">
+        <p class="text-sm font-medium text-gray-300">Challenge Backend URL</p>
+        <input bind:value={challenge_url} placeholder="Optional direct attack backend URL" class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" />
+        <p class="text-xs text-gray-500">If set, attacks will bypass the Supabase edge function and call this URL directly with the same payload.</p>
+      </div>
+
+      <div class="space-y-2 col-span-2">
         <p class="text-sm font-medium text-gray-300">System Context</p>
         <textarea bind:value={context} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white h-32 font-mono text-sm focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all" placeholder="Model system instructions..."></textarea>
       </div>
@@ -301,6 +312,9 @@
         <div class="border border-white/10 bg-slate-900/40 backdrop-blur-sm p-5 rounded-xl hover:border-red-500/30 transition-colors shadow-lg">
           <h3 class="font-bold text-lg text-white">{challenge.model_name}</h3>
           <span class="inline-block px-2.5 py-1 bg-red-500/10 border border-red-500/20 text-xs rounded-full text-red-400 mt-2 font-medium">{challenge.type}</span>
+          {#if challenge.challenge_url}
+            <p class="mt-2 text-xs text-gray-400 break-all">Backend URL: {challenge.challenge_url}</p>
+          {/if}
           <div class="mt-3 text-xs text-gray-300 bg-black/30 rounded p-2 space-y-1">
             <p>Defense Reward: {challenge.defense_reward_coins ?? 0} coins</p>
             <p>Attack Steal: {challenge.attack_steal_coins ?? 0} coins</p>

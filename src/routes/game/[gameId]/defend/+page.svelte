@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
@@ -127,6 +128,9 @@
 
 <div class="p-8 max-w-7xl mx-auto space-y-8">
   <div class="border-b border-white/10 pb-6">
+    <div class="mb-4">
+      <GameSectionNav gameId={gameId} current="defend" />
+    </div>
     <h1 class="text-4xl font-black tracking-tight text-white mb-2">Blue Team: Defense Console</h1>
     <p class="text-gray-400 text-lg">Choose a challenge to open its dedicated defense options page.</p>
     {#if roundInfo}

@@ -1,6 +1,22 @@
+<script module lang="ts">
+  type AttackTargetsCacheEntry = {
+    gameName: string;
+    roundInfo: any;
+    challenges: any[];
+    selectedChallengeId: string;
+    initialAttackPrompt: string;
+    statusError: string;
+    timestampMs: number;
+  };
+
+  const ATTACK_TARGETS_CACHE_TTL_MS = 60_000;
+  const attackTargetsCache = new Map<string, AttackTargetsCacheEntry>();
+</script>
+
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
@@ -14,8 +30,57 @@
   let loading = $state(false);
   let statusError = $state('');
   let attackMode = $derived(resolveRoundType(roundInfo));
+  let loadingTargets = $state(false);
 
-  onMount(async () => {
+  function cacheKey() {
+    return gameId;
+  }
+
+  function restoreFromCache() {
+    const key = cacheKey();
+    if (!key) return false;
+
+    const cached = attackTargetsCache.get(key);
+    if (!cached) return false;
+
+    if (Date.now() - cached.timestampMs > ATTACK_TARGETS_CACHE_TTL_MS) {
+      attackTargetsCache.delete(key);
+      return false;
+    }
+
+    gameName = cached.gameName;
+    roundInfo = cached.roundInfo;
+    challenges = cached.challenges;
+    selectedChallengeId = cached.selectedChallengeId;
+    initialAttackPrompt = cached.initialAttackPrompt;
+    statusError = cached.statusError;
+    return true;
+  }
+
+  function saveToCache() {
+    const key = cacheKey();
+    if (!key) return;
+
+    attackTargetsCache.set(key, {
+      gameName,
+      roundInfo,
+      challenges,
+      selectedChallengeId,
+      initialAttackPrompt,
+      statusError,
+      timestampMs: Date.now()
+    });
+  }
+
+  $effect(() => {
+    if (!loadingTargets) {
+      saveToCache();
+    }
+  });
+
+  async function loadAttackTargets() {
+    if (loadingTargets) return;
+    loadingTargets = true;
     statusError = '';
 
     try {
@@ -147,6 +212,16 @@
       }
     } catch (err: any) {
       statusError = err?.message || 'Unexpected error while loading attack targets.';
+    } finally {
+      saveToCache();
+      loadingTargets = false;
+    }
+  }
+
+  onMount(() => {
+    const restored = restoreFromCache();
+    if (!restored) {
+      void loadAttackTargets();
     }
   });
 
@@ -168,6 +243,9 @@
 
 <div class="p-8 max-w-6xl mx-auto space-y-8">
   <div class="border-b border-white/10 pb-6">
+    <div class="mb-4">
+      <GameSectionNav gameId={gameId} current="attack" />
+    </div>
     <h1 class="text-4xl font-black tracking-tight text-white mb-2 flex items-center gap-3">
       <span class="text-red-500">⚡</span> Red Team: Attack Interface
     </h1>

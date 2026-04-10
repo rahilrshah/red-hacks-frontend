@@ -118,17 +118,21 @@ function resolveChallengeTools(challenge: any) {
 
 function buildResolvedChallengePayload(targetDetails: any, challengeId: string, targetSecretKey: string | null) {
   const challenges = targetDetails?.challenges ?? {};
-  const systemPrompt =
-    (targetDetails?.system_prompt as string | undefined)?.trim() ||
+  const challengeSystemPrompt =
     (challenges?.default_prompt as string | undefined)?.trim() ||
+    (challenges?.context as string | undefined)?.trim() ||
     'You are a helpful assistant.';
+  const defenderSystemPrompt = (targetDetails?.system_prompt as string | undefined)?.trim() || null;
 
   return {
     challenge_id: challengeId,
+    challenge_type: challenges?.type ?? null,
     title: challenges?.model_name ?? 'Challenge',
     description: challenges?.description ?? '',
     objective: parseChallengeObjective(challenges),
-    system_prompt: systemPrompt,
+    challenge_system_prompt: challengeSystemPrompt,
+    defender_system_prompt: defenderSystemPrompt,
+    system_prompt: defenderSystemPrompt || challengeSystemPrompt,
     success_tool_name: challenges?.target_tool_name ?? null,
     success_tool_args: challenges?.target_tool_args ?? null,
     interp_args: challenges?.interp_args ?? null,
@@ -164,6 +168,21 @@ function buildAttackRequestPayload(body: AttackRequestBody, targetDetails: any, 
   }
 
   return payload;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
 }
 
 async function forwardToBackend(url: string, requestInit: RequestInit) {
@@ -463,6 +482,44 @@ export const POST: RequestHandler = async ({ params, request }) => {
     const outboundPayload = buildAttackRequestPayload(body, targetDetails, effectiveChallengeId, targetSecretKey);
     const hasDirectBackend = typeof targetDetails?.challenges?.challenge_url === 'string' && targetDetails.challenges.challenge_url.trim().length > 0;
 
+    if (hasDirectBackend && attackerTeamId) {
+      const cooldownTargetColumn = isPveTarget ? 'challenge_id' : 'defended_challenge_id';
+      const cooldownTargetValue = isPveTarget ? effectiveChallengeId : (targetDetails?.id ?? defendedChallengeId);
+
+      const { data: mostRecentAttack, error: mostRecentAttackError } = await supabaseAdmin
+        .from('attacks')
+        .select('created_at')
+        .eq('attacker_team_id', attackerTeamId)
+        .eq(cooldownTargetColumn, cooldownTargetValue)
+        .eq('is_successful', true)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (mostRecentAttackError) {
+        return json({ success: false, error: 'Unable to verify attack cooldown' }, { status: 500 });
+      }
+
+      if (mostRecentAttack?.created_at) {
+        const lastAttackMs = new Date(mostRecentAttack.created_at).getTime();
+
+        if (!Number.isNaN(lastAttackMs)) {
+          const elapsedMs = Date.now() - lastAttackMs;
+
+          if (elapsedMs < ATTACK_COOLDOWN_MS) {
+            const remainingSeconds = Math.ceil((ATTACK_COOLDOWN_MS - elapsedMs) / 1000);
+
+            return json({
+              success: false,
+              message: `Cooldown active for this target. Try again in ${remainingSeconds} seconds.`,
+              cooldown_remaining_seconds: remainingSeconds,
+              log: 'Attack blocked by cooldown policy.'
+            });
+          }
+        }
+      }
+    }
+
     const outboundHeaders: Record<string, string> = {
       'Content-Type': 'application/json'
     };
@@ -517,6 +574,42 @@ export const POST: RequestHandler = async ({ params, request }) => {
         (parsedBody as any).defender_coins_after = transferResult.defender_coins ?? null;
         (parsedBody as any).attacker_coins_after = transferResult.attacker_coins ?? null;
         (parsedBody as any).defender_eliminated = transferResult.defender_eliminated ?? false;
+      }
+    }
+
+    if (hasDirectBackend) {
+      const parsedObject = parsedBody && typeof parsedBody === 'object' ? (parsedBody as any) : null;
+      const attackSucceeded = response.ok && (parsedObject?.success === true || parsedObject?.success === 'true');
+      const stolenCoins = Math.max(0, asFiniteNumber(parsedObject?.stolen_coins) ?? 0);
+      const latestPrompt = body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || '';
+
+      const attackLog = {
+        source: 'direct-backend',
+        backend_status: response.status,
+        backend_url: targetUrl,
+        latest_prompt: latestPrompt,
+        assistant_message: typeof parsedObject?.assistant === 'string' ? parsedObject.assistant : null,
+        backend_message: typeof parsedObject?.message === 'string' ? parsedObject.message : null,
+        backend_log: parsedObject?.log ?? (typeof parsedBody === 'string' ? parsedBody : null),
+        called_tools: Array.isArray(parsedObject?.tool_calls) ? parsedObject.tool_calls : [],
+        outcome: attackSucceeded ? 'success' : 'failed',
+        stolen_coins: stolenCoins,
+        defender_coins_after: asFiniteNumber(parsedObject?.defender_coins_after),
+        attacker_coins_after: asFiniteNumber(parsedObject?.attacker_coins_after),
+        defender_eliminated: parsedObject?.defender_eliminated === true
+      };
+
+      const { error: attackInsertError } = await supabaseAdmin.from('attacks').insert({
+        defended_challenge_id: isPveTarget ? null : (targetDetails?.id ?? defendedChallengeId),
+        challenge_id: effectiveChallengeId,
+        attacker_user_id: attackerUserId,
+        attacker_team_id: attackerTeamId,
+        is_successful: attackSucceeded,
+        log: attackLog
+      });
+
+      if (attackInsertError) {
+        console.error('Failed to persist direct-backend attack event', attackInsertError);
       }
     }
 

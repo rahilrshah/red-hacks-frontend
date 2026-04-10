@@ -53,7 +53,10 @@ class ChallengeInfo(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     objective: Optional[str] = None
+    challenge_type: Optional[str] = None
     system_prompt: Optional[str] = None
+    challenge_system_prompt: Optional[str] = None
+    defender_system_prompt: Optional[str] = None
     success_tool_name: Optional[str] = None
     success_tool_args: Optional[Dict[str, Any]] = None
     interp_args: Optional[List[Dict[str, Any]]] = None
@@ -124,7 +127,7 @@ def normalize_tools(raw_tools: Any) -> List[Dict[str, Any]]:
     for raw_tool in raw_tools:
         tool_spec = normalize_tool_spec(raw_tool)
         if tool_spec is not None:
-          normalized.append(tool_spec)
+                        normalized.append(tool_spec)
 
     return normalized
 
@@ -234,13 +237,36 @@ async def call_openrouter(
         "Content-Type": "application/json",
     }
 
-    system_prompt = challenge.system_prompt.strip() if challenge.system_prompt else "You are a helpful assistant."
+    challenge_prompt = (challenge.challenge_system_prompt or "").strip()
+    defender_prompt = (challenge.defender_system_prompt or "").strip()
+    legacy_prompt = (challenge.system_prompt or "").strip()
+    target_secret = (challenge.target_secret_key or SECRET_PHRASE).strip()
+
+    system_messages: List[Dict[str, str]] = []
+    if challenge_prompt:
+        system_messages.append({"role": "system", "content": challenge_prompt})
+    if defender_prompt:
+        system_messages.append({"role": "system", "content": defender_prompt})
+    if not defender_prompt and legacy_prompt:
+        system_messages.append({"role": "system", "content": legacy_prompt})
+    if target_secret:
+        system_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Challenge secret key (exact value): "
+                    f"{target_secret}"
+                ),
+            }
+        )
+    if not system_messages:
+        system_messages.append({"role": "system", "content": "You are a helpful assistant."})
 
     tools = normalize_tools(challenge.tools if challenge.tools is not None else CHALLENGE_TOOLS)
 
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "messages": system_messages + messages,
     }
 
 
@@ -250,6 +276,7 @@ async def call_openrouter(
 
     try:
         async with httpx.AsyncClient() as client:
+            print(payload, challenge)
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 json=payload,
@@ -316,16 +343,28 @@ async def handle_tool_calling_attack(request: AttackRequest) -> AttackResponse:
 async def handle_secret_key_attack(request: AttackRequest) -> AttackResponse:
     challenge = normalize_challenge(request)
     target_secret = (challenge.target_secret_key or SECRET_PHRASE).strip()
+    chat_messages = normalize_messages(request)
 
     if not target_secret:
         raise HTTPException(status_code=500, detail="No secret key configured for this backend.")
+
+    if not chat_messages and not (request.guess or "").strip():
+        raise HTTPException(status_code=400, detail="Provide a prompt/messages turn or a guess.")
+
+    assistant_text = ""
+    model_log = "No model turn requested."
+    if chat_messages:
+        model_result = await call_openrouter(chat_messages, challenge)
+        assistant_text = str(model_result.get("assistant") or "")
+        model_log = "Model turn completed."
 
     guess = (request.guess or "").strip()
     if not guess:
         return build_response(
             False,
-            "Secret key guess required.",
-            log="No guess was supplied.",
+            "No guess submitted yet. Continue probing the model, then submit a guess.",
+            assistant=assistant_text,
+            log=f"{model_log} Guess not supplied.",
         )
 
     success = guess.lower() == target_secret.lower()
@@ -333,7 +372,8 @@ async def handle_secret_key_attack(request: AttackRequest) -> AttackResponse:
     return build_response(
         success,
         output_message,
-        log="Secret-key check completed.",
+        assistant=assistant_text,
+        log=f"{model_log} Secret-key check completed.",
     )
 
 
@@ -354,6 +394,25 @@ async def handle_banana_attack(request: AttackRequest) -> AttackResponse:
 
 
 async def dispatch_attack(request: AttackRequest, mode: str) -> AttackResponse:
+    if mode == "auto":
+        challenge = normalize_challenge(request)
+        challenge_type = (challenge.challenge_type or "").strip().lower()
+        has_guess = bool((request.guess or "").strip())
+        has_secret = bool((challenge.target_secret_key or SECRET_PHRASE).strip())
+        has_tool_name = bool((challenge.success_tool_name or TARGET_TOOL_NAME).strip())
+        has_tools = bool(normalize_tools(challenge.tools if challenge.tools is not None else CHALLENGE_TOOLS))
+
+        if challenge_type == "secret-key":
+            mode = "secret-key"
+        elif challenge_type == "tool-calling":
+            mode = "tool-calling"
+        elif has_tool_name or has_tools:
+            mode = "tool-calling"
+        elif has_secret:
+            mode = "secret-key"
+        else:
+            mode = "tool-calling"
+
     if mode == "tool-calling":
         return await handle_tool_calling_attack(request)
     if mode == "secret-key":
@@ -366,7 +425,7 @@ async def dispatch_attack(request: AttackRequest, mode: str) -> AttackResponse:
 
 @app.post("/attack", response_model=AttackResponse)
 async def attack_endpoint(request: AttackRequest):
-    return await dispatch_attack(request, "tool-calling")
+    return await dispatch_attack(request, "auto")
 
 
 @app.post("/attack/tool-calling", response_model=AttackResponse)
@@ -386,7 +445,7 @@ async def banana_attack_endpoint(request: AttackRequest):
 
 @app.post("/", response_model=AttackResponse)
 async def root_attack_endpoint(request: AttackRequest):
-    return await dispatch_attack(request, "tool-calling")
+    return await dispatch_attack(request, "auto")
 
 
 @app.options("/")

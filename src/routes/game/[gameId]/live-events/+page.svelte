@@ -1,7 +1,8 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { supabase } from '$lib/supabaseClient';
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount } from 'svelte';
 
   type EventRow = {
     id: string;
@@ -26,6 +27,9 @@
   let eventFeed = $state<EventRow[]>([]);
   let topPlayers = $state<TopPlayerRow[]>([]);
   let topTeams = $state<Array<{ id: string; name: string; coins: number }>>([]);
+  let attacksChannel: any = null;
+  let defensesChannel: any = null;
+  let teamsChannel: any = null;
 
   let attacksCache = $state<any[]>([]);
   let defensesCache = $state<any[]>([]);
@@ -81,7 +85,7 @@
       .map((row: any) => {
         const attacker = row.profiles?.full_name || row.profiles?.username || 'Unknown attacker';
         const defenderTeam = row.defended_challenge?.teams?.name || 'Unknown team';
-        const challengeName = row.defended_challenge?.challenges?.name || row.defended_challenge?.challenges?.model_name || 'Challenge';
+        const challengeName = row.defended_challenge?.challenges?.model_name || 'Challenge';
         const stolen = extractStolenCoins(row.log);
 
         return {
@@ -95,7 +99,7 @@
 
     const defenseEvents: EventRow[] = (defenses ?? []).map((row: any) => {
       const teamName = row.teams?.name || 'Unknown team';
-      const challengeName = row.challenges?.name || row.challenges?.model_name || 'Challenge';
+      const challengeName = row.challenges?.model_name || 'Challenge';
 
       return {
         id: `defense-${row.id}`,
@@ -125,7 +129,7 @@
   async function loadAttacksAndTopPlayers() {
     const { data, error } = await supabase
       .from('attacks')
-      .select('id, created_at, is_successful, attacker_user_id, log, profiles!attacks_attacker_user_id_fkey(full_name, username), defended_challenge:defended_challenges!inner(id, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(name, model_name))')
+      .select('id, created_at, is_successful, attacker_user_id, log, profiles!attacks_attacker_user_id_fkey(full_name, username), defended_challenge:defended_challenges!inner(id, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(model_name))')
       .eq('defended_challenge.teams.game_id', gameId)
       .order('created_at', { ascending: false })
       .limit(300);
@@ -140,7 +144,7 @@
   async function loadDefenses() {
     const { data, error } = await supabase
       .from('defended_challenges')
-      .select('id, created_at, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(name, model_name)')
+      .select('id, created_at, team_id, challenge_id, teams!inner(game_id, name), challenges!inner(model_name)')
       .eq('teams.game_id', gameId)
       .order('created_at', { ascending: false })
       .limit(300);
@@ -177,41 +181,46 @@
     }
   }
 
-  onMount(async () => {
-    await loadAll();
+  onMount(() => {
+    void (async () => {
+      await loadAll();
 
-    const attacksChannel = supabase
-      .channel(`live-events-attacks-${gameId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attacks' }, async () => {
-        await loadAttacksAndTopPlayers();
-      })
-      .subscribe();
+      attacksChannel = supabase
+        .channel(`live-events-attacks-${gameId}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'attacks' }, async () => {
+          await loadAttacksAndTopPlayers();
+        })
+        .subscribe();
 
-    const defensesChannel = supabase
-      .channel(`live-events-defenses-${gameId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'defended_challenges' }, async () => {
-        await loadDefenses();
-      })
-      .subscribe();
+      defensesChannel = supabase
+        .channel(`live-events-defenses-${gameId}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'defended_challenges' }, async () => {
+          await loadDefenses();
+        })
+        .subscribe();
 
-    const teamsChannel = supabase
-      .channel(`live-events-teams-${gameId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `game_id=eq.${gameId}` }, async () => {
-        await loadTopTeams();
-      })
-      .subscribe();
+      teamsChannel = supabase
+        .channel(`live-events-teams-${gameId}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `game_id=eq.${gameId}` }, async () => {
+          await loadTopTeams();
+        })
+        .subscribe();
+    })();
 
-    onDestroy(() => {
-      supabase.removeChannel(attacksChannel);
-      supabase.removeChannel(defensesChannel);
-      supabase.removeChannel(teamsChannel);
-    });
+    return () => {
+      if (attacksChannel) supabase.removeChannel(attacksChannel);
+      if (defensesChannel) supabase.removeChannel(defensesChannel);
+      if (teamsChannel) supabase.removeChannel(teamsChannel);
+    };
   });
 </script>
 
 <div class="p-8 max-w-7xl mx-auto space-y-8">
   <div class="border-b border-white/10 pb-6">
     <a href={`/game/${gameId}`} class="inline-flex items-center text-sm text-gray-400 hover:text-white transition-colors mb-4">&larr; Back to Game Hub</a>
+    <div class="mb-4">
+      <GameSectionNav gameId={gameId} current="live-events" />
+    </div>
     <h1 class="text-4xl font-black tracking-tight text-white mb-2 flex items-center gap-3">
       <span class="text-red-500">📡</span> Live Events
     </h1>

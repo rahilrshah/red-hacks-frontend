@@ -1,5 +1,19 @@
+<script module lang="ts">
+  type AttackSessionCacheEntry = {
+    roundInfo: any;
+    target: any;
+    statusError: string;
+    pageLoading: boolean;
+    timestampMs: number;
+  };
+
+  const ATTACK_SESSION_CACHE_TTL_MS = 60_000;
+  const attackSessionCache = new Map<string, AttackSessionCacheEntry>();
+</script>
+
 <script lang="ts">
   import { page } from '$app/stores';
+  import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
@@ -23,32 +37,79 @@
   let attackResult = $state<any>(null);
   let userId = $state('');
   let statusError = $state('');
+  let isRefreshingOnVisible = $state(false);
 
   let attackMode = $derived(resolveRoundType(roundInfo));
   const chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${defendedChallengeId}`);
 
-  onMount(async () => {
-    const { data: userData } = await supabase.auth.getUser();
-    userId = userData?.user?.id ?? '';
+  function sessionCacheKey() {
+    return `${gameId}:${defendedChallengeId}`;
+  }
 
-    await loadTarget();
-    // Load chat history AFTER roundInfo is available so chatStorageKey is correct
-    if (roundInfo) {
-      loadChatHistory();
+  function restoreSessionCache() {
+    const key = sessionCacheKey();
+    if (!key) return false;
+
+    const cached = attackSessionCache.get(key);
+    if (!cached) return false;
+
+    if (Date.now() - cached.timestampMs > ATTACK_SESSION_CACHE_TTL_MS) {
+      attackSessionCache.delete(key);
+      return false;
     }
 
-    const initialSeed = $page.url.searchParams.get('seed')?.trim();
-    if (initialSeed) {
-      promptInput = initialSeed;
-      try {
-        await sendPrompt();
-      } catch (err: any) {
-        statusError = err?.message || 'Failed to send initial seed prompt';
+    roundInfo = cached.roundInfo;
+    target = cached.target;
+    statusError = cached.statusError;
+    pageLoading = cached.pageLoading;
+    return true;
+  }
+
+  function saveSessionCache() {
+    const key = sessionCacheKey();
+    if (!key) return;
+
+    attackSessionCache.set(key, {
+      roundInfo,
+      target,
+      statusError,
+      pageLoading,
+      timestampMs: Date.now()
+    });
+  }
+
+  $effect(() => {
+    if (!roundInfo) return;
+    loadChatHistory();
+  });
+
+  onMount(() => {
+    void (async () => {
+      const { data: userData } = await supabase.auth.getUser();
+      userId = userData?.user?.id ?? '';
+
+      const restored = restoreSessionCache();
+      if (!restored) {
+        await loadTarget();
       }
-      const nextUrl = new URL(window.location.href);
-      nextUrl.searchParams.delete('seed');
-      window.history.replaceState(window.history.state, '', nextUrl.toString());
-    }
+      // Load chat history AFTER roundInfo is available so chatStorageKey is correct
+      if (roundInfo) {
+        loadChatHistory();
+      }
+
+      const initialSeed = $page.url.searchParams.get('seed')?.trim();
+      if (initialSeed) {
+        promptInput = initialSeed;
+        try {
+          await sendPrompt();
+        } catch (err: any) {
+          statusError = err?.message || 'Failed to send initial seed prompt';
+        }
+        const nextUrl = new URL(window.location.href);
+        nextUrl.searchParams.delete('seed');
+        window.history.replaceState(window.history.state, '', nextUrl.toString());
+      }
+    })();
   });
 
   async function loadTarget() {
@@ -198,7 +259,7 @@
 
     const { data, error } = await supabase
       .from('defended_challenges')
-      .select('id, team_id, system_prompt, teams!inner(name, game_id), challenges!inner(*)')
+      .select('id, team_id, system_prompt, target_secret_key, teams!inner(name, game_id), challenges!inner(*)')
       .eq('id', defendedChallengeId)
       .eq('teams.game_id', gameId)
       .single();
@@ -234,6 +295,7 @@
 
     target = data;
     pageLoading = false;
+    saveSessionCache();
   }
 
   function loadChatHistory() {
@@ -263,20 +325,34 @@
 
   function buildAttackPayload(args: { guess?: string } = {}) {
     const currentAttackMode = resolveRoundType(roundInfo);
+    const resolvedSystemPrompt =
+      (target?.system_prompt as string | undefined)?.trim() ||
+      (target?.challenges?.default_prompt as string | undefined)?.trim() ||
+      'You are a helpful assistant.';
 
     const payload: Record<string, unknown> = {
       prompt: messages.length > 0 ? messages[messages.length - 1].content : '',
       guess: args.guess || '',
-      messages: toChatMessages()
+      messages: toChatMessages(),
+      challenge: {
+        challenge_id: target?.challenges?.id ?? defendedChallengeId,
+        title: target?.challenges?.model_name ?? 'Challenge',
+        description: target?.challenges?.description ?? '',
+        objective:
+          target?.challenges?.type === 'tool-calling'
+            ? `Induce targeted tool use: ${target?.challenges?.target_tool_name ?? 'unknown tool'}`
+            : 'Extract the secret key.',
+        system_prompt: resolvedSystemPrompt,
+        success_tool_name: target?.challenges?.target_tool_name ?? null
+      }
     };
 
     if (currentAttackMode === 'pve') {
-      payload.challenge_id = target?.challenges?.id ?? defendedChallengeId;
+      payload.challenge_id = defendedChallengeId;
       payload.game_id = gameId;
       payload.round_type = 'pve';
     } else {
       payload.defended_challenge_id = defendedChallengeId;
-      payload.game_id = gameId;
     }
 
     return payload;
@@ -284,40 +360,12 @@
 
   async function parseAttackResponse(response: Response) {
     const responseText = await response.text();
-    let parsed: any = null;
 
     try {
-      parsed = responseText ? JSON.parse(responseText) : null;
+      return responseText ? JSON.parse(responseText) : null;
     } catch {
-      parsed = responseText;
+      return responseText;
     }
-
-    return { responseText, parsed };
-  }
-
-  async function postAttackRequest(accessToken: string, payload: Record<string, unknown>) {
-    const response = await fetch(`/game/${gameId}/attack`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`
-      },
-      body: JSON.stringify(payload),
-      mode: 'same-origin'
-    });
-
-    const result = await parseAttackResponse(response);
-
-    if (response.ok) {
-      return result.parsed;
-    }
-
-    throw new Error(
-      result.parsed?.error ||
-        result.parsed?.message ||
-        result.responseText ||
-        `Attack dispatcher returned ${response.status}`
-    );
   }
 
   async function invokeAttack(args: { guess?: string } = {}) {
@@ -339,26 +387,54 @@
 
     const payload = buildAttackPayload(args);
 
+    let responseData: any = null;
     try {
-      const responseData = await postAttackRequest(accessToken, payload);
-      attackResult = responseData;
+      const response = await fetch(`/game/${gameId}/attack`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`
+        },
+        body: JSON.stringify(payload)
+      });
 
-      if (responseData?.assistant) {
-        messages = [
-          ...messages,
-          {
-            role: 'assistant',
-            content: responseData.assistant,
-            timestamp: new Date().toISOString()
-          }
-        ];
-        persistChatHistory();
+      responseData = await parseAttackResponse(response);
+      if (!response.ok) {
+        const errorMessage =
+          responseData?.error ||
+          responseData?.message ||
+          (typeof responseData === 'string' ? responseData : '') ||
+          `Attack request failed with status ${response.status}`;
+        throw new Error(errorMessage);
       }
     } catch (err: any) {
       attackResult = {
         success: false,
         error: err?.message || 'Unexpected error while connecting to attack backend.'
       };
+      return;
+    }
+
+    if (!responseData || typeof responseData !== 'object') {
+      attackResult = {
+        success: false,
+        error: 'Attack backend returned an invalid response payload.'
+      };
+      return;
+    }
+
+    attackResult = responseData;
+
+    if (responseData?.assistant) {
+      messages = [
+        ...messages,
+        {
+          role: 'assistant',
+          content: responseData.assistant,
+          timestamp: new Date().toISOString()
+        }
+      ];
+      persistChatHistory();
     }
   }
 
@@ -428,9 +504,12 @@
 <div class="p-8 max-w-6xl mx-auto space-y-8">
   <div class="border-b border-white/10 pb-6">
     <a href={`/game/${gameId}/attack`} class="inline-flex items-center text-sm text-gray-400 hover:text-white transition-colors mb-4">&larr; Back to Target List</a>
+    <div class="mb-4">
+      <GameSectionNav gameId={gameId} current="attack" />
+    </div>
     <h1 class="text-4xl font-black tracking-tight text-white mb-2">Attack Session</h1>
     {#if target}
-      <p class="text-gray-400 text-lg">{attackMode === 'pvp' ? 'Target team' : 'Target challenge'}: <span class="text-red-400 font-semibold">{target.teams?.name || 'Default Defense'}</span> • Challenge: <span class="text-white font-semibold">{target.challenges?.name || target.challenges?.model_name}</span></p>
+      <p class="text-gray-400 text-lg">{attackMode === 'pvp' ? 'Target team' : 'Target challenge'}: <span class="text-red-400 font-semibold">{target.teams?.name || 'Default Defense'}</span> • Challenge: <span class="text-white font-semibold">{target.challenges?.model_name}</span></p>
       {#if roundInfo}
         <p class="text-xs text-gray-500 mt-2">Round: {roundInfo.name} • {roundInfo.type.toUpperCase()}</p>
       {/if}

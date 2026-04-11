@@ -126,6 +126,120 @@ async function applyCoinSteal(
   return row
 }
 
+async function incrementTeamCoinsRpc(supabaseAdmin: any, teamId: string, delta: number): Promise<number | null> {
+  const { data, error } = await supabaseAdmin.rpc('increment_team_coins', {
+    p_team_id: teamId,
+    p_delta: delta
+  })
+
+  if (error) {
+    throw new Error(error.message || 'Failed to increment team coins')
+  }
+
+  if (typeof data === 'number') return data
+  if (Array.isArray(data) && typeof data[0] === 'number') return data[0]
+  return null
+}
+
+// NOTE: keep in sync with src/lib/bonus.ts. Deno edge functions cannot import
+// from the SvelteKit src/ tree. Unit-tested in src/lib/bonus.test.ts.
+const SOFT_TURN_CAP = 10
+const SOFT_CHAR_CAP = 4000
+
+type AttackBonusInput = {
+  turnCount: number
+  charCount: number
+  attackStealCoins: number
+  defenseRewardCoins: number
+}
+
+type AttackBonusResult = {
+  base: number
+  bonus: number
+  total: number
+  eleganceFactor: number
+  maxBonus: number
+}
+
+function sanitizeInteger(value: number, minimum: number): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) return minimum
+  return Math.max(minimum, Math.trunc(value))
+}
+
+function calculateAttackBonus(input: AttackBonusInput): AttackBonusResult {
+  const base = sanitizeInteger(input.attackStealCoins, 0)
+  const defenseReward = sanitizeInteger(input.defenseRewardCoins, 0)
+  const maxBonus = Math.min(defenseReward, 3 * base)
+
+  const turns = sanitizeInteger(input.turnCount, 1)
+  const chars = sanitizeInteger(input.charCount, 0)
+
+  const turnFactor = Math.max(0, 1 - (turns - 1) / SOFT_TURN_CAP)
+  const charFactor = Math.max(0, 1 - chars / SOFT_CHAR_CAP)
+  const eleganceFactor = Math.min(turnFactor, charFactor)
+
+  const bonus = Math.floor(maxBonus * eleganceFactor)
+  const total = base + bonus
+
+  return { base, bonus, total, eleganceFactor, maxBonus }
+}
+
+type EleganceBonusArgs = {
+  supabaseAdmin: any
+  attackerTeamId: string
+  defendedChallengeId: string | null
+  pveChallengeId: string | null
+  defendedChallengeUpdatedAt: string | null
+  attackStealCoins: number
+  defenseRewardCoins: number
+  currentPromptChars: number
+}
+
+async function computeEleganceBonus(args: EleganceBonusArgs): Promise<AttackBonusResult & { turnCount: number; charCount: number }> {
+  const targetColumn = args.defendedChallengeId ? 'defended_challenge_id' : 'challenge_id'
+  const targetValue = args.defendedChallengeId ?? args.pveChallengeId ?? ''
+
+  const { data: lastSuccess } = await args.supabaseAdmin
+    .from('attacks')
+    .select('created_at')
+    .eq('attacker_team_id', args.attackerTeamId)
+    .eq(targetColumn, targetValue)
+    .eq('is_successful', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  const lastSuccessMs = lastSuccess?.created_at ? new Date(lastSuccess.created_at).getTime() : 0
+  const updatedAtMs = args.defendedChallengeUpdatedAt ? new Date(args.defendedChallengeUpdatedAt).getTime() : 0
+  const windowStartIso = new Date(Math.max(lastSuccessMs, updatedAtMs)).toISOString()
+
+  const { data: priorAttempts } = await args.supabaseAdmin
+    .from('attacks')
+    .select('is_successful, log')
+    .eq('attacker_team_id', args.attackerTeamId)
+    .eq(targetColumn, targetValue)
+    .gt('created_at', windowStartIso)
+    .eq('is_successful', false)
+
+  const priorTurns = priorAttempts?.length ?? 0
+  const priorChars = (priorAttempts ?? []).reduce((acc: number, row: any) => {
+    const logPrompt = row?.log?.latest_prompt
+    return acc + (typeof logPrompt === 'string' ? logPrompt.length : 0)
+  }, 0)
+
+  const turnCount = priorTurns + 1
+  const charCount = priorChars + Math.max(0, args.currentPromptChars)
+
+  const bonus = calculateAttackBonus({
+    turnCount,
+    charCount,
+    attackStealCoins: args.attackStealCoins,
+    defenseRewardCoins: args.defenseRewardCoins
+  })
+
+  return { ...bonus, turnCount, charCount }
+}
+
 Deno.serve(async (req) => {
   console.log('hit attack function endpoint')
   const corsHeaders = {
@@ -504,14 +618,49 @@ Deno.serve(async (req) => {
           }
         }
 
+        const currentPromptChars = (guess ?? '').length + (latestPrompt ?? '').length
+        const challengeStealCoins = Math.max(0, Math.trunc(challenges.attack_steal_coins ?? 0))
+        const challengeDefenseReward = Math.max(0, Math.trunc(challenges.defense_reward_coins ?? 0))
+
+        const bonusResult = await computeEleganceBonus({
+          supabaseAdmin,
+          attackerTeamId,
+          defendedChallengeId: isPveTarget ? null : (targetDetails?.id ?? defended_challenge_id ?? null),
+          pveChallengeId: isPveTarget ? (challenge_id ?? null) : null,
+          defendedChallengeUpdatedAt: isPveTarget ? null : (targetDetails?.updated_at ?? null),
+          attackStealCoins: challengeStealCoins,
+          defenseRewardCoins: challengeDefenseReward,
+          currentPromptChars
+        })
+
+        let attackerCoinsAfter = transferResult?.attacker_coins ?? null
+        if (bonusResult.bonus > 0 && attackerTeamId) {
+          const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusResult.bonus)
+          if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
+        }
+        // PvE secret-key: no transfer happened, so the base coins also need to be minted here.
+        if (isPveTarget && bonusResult.base > 0 && attackerTeamId) {
+          const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusResult.base)
+          if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
+        }
+
+        const baseCoins = isPveTarget ? bonusResult.base : (transferResult?.stolen_coins ?? 0)
+        const totalStolen = baseCoins + bonusResult.bonus
+
         const attackLog = {
           ...attackLogBase,
           victory_condition: 'secret-key',
           outcome: 'success',
           assistant_message: 'System breached. Key accepted.',
-          stolen_coins: transferResult?.stolen_coins ?? 0,
+          stolen_coins: totalStolen,
+          base_coins: baseCoins,
+          bonus_coins: bonusResult.bonus,
+          elegance_factor: bonusResult.eleganceFactor,
+          max_bonus: bonusResult.maxBonus,
+          turn_count: bonusResult.turnCount,
+          char_count: bonusResult.charCount,
           defender_coins_after: transferResult?.defender_coins ?? null,
-          attacker_coins_after: transferResult?.attacker_coins ?? null,
+          attacker_coins_after: attackerCoinsAfter,
           defender_eliminated: transferResult?.defender_eliminated ?? false
         }
 
@@ -529,10 +678,18 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({
           success: true,
           message: isPveTarget
-            ? 'The secret key was successfully extracted.'
-            : `The secret key was successfully extracted! Stole ${transferResult?.stolen_coins ?? 0} coins.`,
+            ? `The secret key was successfully extracted. Earned ${totalStolen} coins.`
+            : `The secret key was successfully extracted! Stole ${totalStolen} coins.`,
           log: 'System breached. Key accepted.',
-          stolen_coins: transferResult?.stolen_coins ?? 0,
+          stolen_coins: totalStolen,
+          base_coins: baseCoins,
+          bonus_coins: bonusResult.bonus,
+          elegance_factor: bonusResult.eleganceFactor,
+          max_bonus: bonusResult.maxBonus,
+          turn_count: bonusResult.turnCount,
+          char_count: bonusResult.charCount,
+          attacker_coins_after: attackerCoinsAfter,
+          defender_coins_after: transferResult?.defender_coins ?? null,
           defender_eliminated: transferResult?.defender_eliminated ?? false
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
@@ -670,6 +827,41 @@ Deno.serve(async (req) => {
       }
     }
 
+    let bonusOutcome: (AttackBonusResult & { turnCount: number; charCount: number }) | null = null
+    let attackerCoinsAfter: number | null = transferResult?.attacker_coins ?? null
+    let baseCoinsOut = transferResult?.stolen_coins ?? 0
+
+    if (isSuccessful) {
+      const currentPromptChars = (latestPrompt ?? '').length
+      const challengeStealCoins = Math.max(0, Math.trunc(challenges.attack_steal_coins ?? 0))
+      const challengeDefenseReward = Math.max(0, Math.trunc(challenges.defense_reward_coins ?? 0))
+
+      bonusOutcome = await computeEleganceBonus({
+        supabaseAdmin,
+        attackerTeamId,
+        defendedChallengeId: isPveTarget ? null : (targetDetails?.id ?? defended_challenge_id ?? null),
+        pveChallengeId: isPveTarget ? (challenge_id ?? null) : null,
+        defendedChallengeUpdatedAt: isPveTarget ? null : (targetDetails?.updated_at ?? null),
+        attackStealCoins: challengeStealCoins,
+        defenseRewardCoins: challengeDefenseReward,
+        currentPromptChars
+      })
+
+      // PvE general path: no transfer happened, mint the base reward.
+      if (isPveTarget && bonusOutcome.base > 0 && attackerTeamId) {
+        const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusOutcome.base)
+        if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
+        baseCoinsOut = bonusOutcome.base
+      }
+
+      if (bonusOutcome.bonus > 0 && attackerTeamId) {
+        const newBalance = await incrementTeamCoinsRpc(supabaseAdmin, attackerTeamId, bonusOutcome.bonus)
+        if (typeof newBalance === 'number') attackerCoinsAfter = newBalance
+      }
+    }
+
+    const totalStolen = baseCoinsOut + (bonusOutcome?.bonus ?? 0)
+
     const attackLog = {
       ...attackLogBase,
       latest_prompt: latestPrompt,
@@ -677,9 +869,15 @@ Deno.serve(async (req) => {
       called_tools: calledTools,
       target_tool_name: challenges.target_tool_name,
       outcome: isSuccessful ? 'success' : 'failed',
-      stolen_coins: transferResult?.stolen_coins ?? 0,
+      stolen_coins: totalStolen,
+      base_coins: baseCoinsOut,
+      bonus_coins: bonusOutcome?.bonus ?? 0,
+      elegance_factor: bonusOutcome?.eleganceFactor ?? null,
+      max_bonus: bonusOutcome?.maxBonus ?? null,
+      turn_count: bonusOutcome?.turnCount ?? null,
+      char_count: bonusOutcome?.charCount ?? null,
       defender_coins_after: transferResult?.defender_coins ?? null,
-      attacker_coins_after: transferResult?.attacker_coins ?? null,
+      attacker_coins_after: attackerCoinsAfter,
       defender_eliminated: transferResult?.defender_eliminated ?? false
     }
 
@@ -694,17 +892,25 @@ Deno.serve(async (req) => {
 
     await uploadAttackTranscript(supabaseAdmin, defended_challenge_id, attackLog)
 
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       success: isSuccessful,
       message: isSuccessful
         ? isPveTarget
-          ? 'Victory condition met.'
-          : `Victory condition met. Stole ${transferResult?.stolen_coins ?? 0} coins.`
+          ? `Victory condition met. Earned ${totalStolen} coins.`
+          : `Victory condition met. Stole ${totalStolen} coins.`
         : 'Prompt evaluated by the model. Read output below.',
       log: `Model Output: ${openAiResponse}`,
       assistant: openAiResponse,
       tool_calls: calledTools,
-      stolen_coins: transferResult?.stolen_coins ?? 0,
+      stolen_coins: totalStolen,
+      base_coins: baseCoinsOut,
+      bonus_coins: bonusOutcome?.bonus ?? 0,
+      elegance_factor: bonusOutcome?.eleganceFactor ?? null,
+      max_bonus: bonusOutcome?.maxBonus ?? null,
+      turn_count: bonusOutcome?.turnCount ?? null,
+      char_count: bonusOutcome?.charCount ?? null,
+      attacker_coins_after: attackerCoinsAfter,
+      defender_coins_after: transferResult?.defender_coins ?? null,
       defender_eliminated: transferResult?.defender_eliminated ?? false,
       challenge_id: isPveTarget ? challenge_id : null
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })

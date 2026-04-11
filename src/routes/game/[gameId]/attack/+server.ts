@@ -1,5 +1,6 @@
 import { env } from '$env/dynamic/private';
 import { PUBLIC_SUPABASE_URL } from '$env/static/public';
+import { calculateAttackBonus, type AttackBonusResult } from '$lib/bonus';
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient } from '@supabase/supabase-js';
 
@@ -240,6 +241,68 @@ async function incrementTeamCoins(
   }
 
   return null;
+}
+
+type EleganceBonusArgs = {
+  supabaseAdmin: ReturnType<typeof createSupabaseAdminClient>;
+  attackerTeamId: string;
+  defendedChallengeId: string | null;
+  pveChallengeId: string | null;
+  defendedChallengeUpdatedAt: string | null;
+  attackStealCoins: number;
+  defenseRewardCoins: number;
+  currentPromptChars: number;
+};
+
+type EleganceBonusOutcome = AttackBonusResult & { turnCount: number; charCount: number };
+
+async function computeEleganceBonus(args: EleganceBonusArgs): Promise<EleganceBonusOutcome> {
+  const targetFilter = args.defendedChallengeId
+    ? { column: 'defended_challenge_id', value: args.defendedChallengeId }
+    : { column: 'challenge_id', value: args.pveChallengeId ?? '' };
+
+  const { data: lastSuccess } = await args.supabaseAdmin
+    .from('attacks')
+    .select('created_at')
+    .eq('attacker_team_id', args.attackerTeamId)
+    .eq(targetFilter.column, targetFilter.value)
+    .eq('is_successful', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const lastSuccessMs = lastSuccess?.created_at ? new Date(lastSuccess.created_at).getTime() : 0;
+  const updatedAtMs = args.defendedChallengeUpdatedAt
+    ? new Date(args.defendedChallengeUpdatedAt).getTime()
+    : 0;
+  const windowStartMs = Math.max(lastSuccessMs, updatedAtMs);
+  const windowStartIso = new Date(windowStartMs).toISOString();
+
+  const { data: priorAttempts } = await args.supabaseAdmin
+    .from('attacks')
+    .select('is_successful, log')
+    .eq('attacker_team_id', args.attackerTeamId)
+    .eq(targetFilter.column, targetFilter.value)
+    .gt('created_at', windowStartIso)
+    .eq('is_successful', false);
+
+  const priorTurns = priorAttempts?.length ?? 0;
+  const priorChars = (priorAttempts ?? []).reduce((acc, row: any) => {
+    const logPrompt = row?.log?.latest_prompt;
+    return acc + (typeof logPrompt === 'string' ? logPrompt.length : 0);
+  }, 0);
+
+  const turnCount = priorTurns + 1;
+  const charCount = priorChars + Math.max(0, args.currentPromptChars);
+
+  const bonus = calculateAttackBonus({
+    turnCount,
+    charCount,
+    attackStealCoins: args.attackStealCoins,
+    defenseRewardCoins: args.defenseRewardCoins
+  });
+
+  return { ...bonus, turnCount, charCount };
 }
 
 export const POST: RequestHandler = async ({ params, request }) => {
@@ -549,16 +612,42 @@ export const POST: RequestHandler = async ({ params, request }) => {
         typeof (parsedBody as any).attacker_coins_after === 'number' ||
         typeof (parsedBody as any).defender_coins_after === 'number';
 
+      const currentPromptChars = (
+        body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || ''
+      ).length;
+      const challengeStealCoins = Math.max(0, Math.trunc(targetDetails?.challenges?.attack_steal_coins ?? 0));
+      const challengeDefenseReward = Math.max(0, Math.trunc(targetDetails?.challenges?.defense_reward_coins ?? 0));
+
       if (isPveTarget) {
-        const rewardCoins = Math.max(0, Math.trunc(targetDetails?.challenges?.attack_steal_coins ?? 0));
+        if (challengeStealCoins > 0 && attackerTeamId && effectiveChallengeId) {
+          const bonusResult = await computeEleganceBonus({
+            supabaseAdmin,
+            attackerTeamId,
+            defendedChallengeId: null,
+            pveChallengeId: effectiveChallengeId,
+            defendedChallengeUpdatedAt: null,
+            attackStealCoins: challengeStealCoins,
+            defenseRewardCoins: challengeDefenseReward,
+            currentPromptChars
+          });
 
-        if (rewardCoins > 0 && attackerTeamId) {
-          const attackerCoinsAfter = await incrementTeamCoins(supabaseAdmin, attackerTeamId, rewardCoins);
+          const totalReward = bonusResult.base + bonusResult.bonus;
+          const attackerCoinsAfter = totalReward > 0
+            ? await incrementTeamCoins(supabaseAdmin, attackerTeamId, totalReward)
+            : null;
 
-          (parsedBody as any).stolen_coins = rewardCoins;
+          (parsedBody as any).stolen_coins = totalReward;
+          (parsedBody as any).base_coins = bonusResult.base;
+          (parsedBody as any).bonus_coins = bonusResult.bonus;
+          (parsedBody as any).elegance_factor = bonusResult.eleganceFactor;
+          (parsedBody as any).max_bonus = bonusResult.maxBonus;
+          (parsedBody as any).turn_count = bonusResult.turnCount;
+          (parsedBody as any).char_count = bonusResult.charCount;
           (parsedBody as any).attacker_coins_after = attackerCoinsAfter;
         } else {
           (parsedBody as any).stolen_coins = 0;
+          (parsedBody as any).base_coins = 0;
+          (parsedBody as any).bonus_coins = 0;
         }
       } else if (!backendReportedTransfer && attackerTeamId && targetDetails?.team_id && effectiveChallengeId) {
         const transferResult = await applyCoinSteal(supabaseAdmin, attackerTeamId, targetDetails.team_id, effectiveChallengeId);
@@ -570,9 +659,33 @@ export const POST: RequestHandler = async ({ params, request }) => {
             .eq('team_id', targetDetails.team_id);
         }
 
-        (parsedBody as any).stolen_coins = transferResult.stolen_coins ?? 0;
+        const bonusResult = await computeEleganceBonus({
+          supabaseAdmin,
+          attackerTeamId,
+          defendedChallengeId: targetDetails.id,
+          pveChallengeId: null,
+          defendedChallengeUpdatedAt: targetDetails?.updated_at ?? null,
+          attackStealCoins: challengeStealCoins,
+          defenseRewardCoins: challengeDefenseReward,
+          currentPromptChars
+        });
+
+        let attackerCoinsAfter = transferResult.attacker_coins ?? null;
+        if (bonusResult.bonus > 0) {
+          const newBalance = await incrementTeamCoins(supabaseAdmin, attackerTeamId, bonusResult.bonus);
+          if (typeof newBalance === 'number') attackerCoinsAfter = newBalance;
+        }
+
+        const baseCoins = transferResult.stolen_coins ?? 0;
+        (parsedBody as any).stolen_coins = baseCoins + bonusResult.bonus;
+        (parsedBody as any).base_coins = baseCoins;
+        (parsedBody as any).bonus_coins = bonusResult.bonus;
+        (parsedBody as any).elegance_factor = bonusResult.eleganceFactor;
+        (parsedBody as any).max_bonus = bonusResult.maxBonus;
+        (parsedBody as any).turn_count = bonusResult.turnCount;
+        (parsedBody as any).char_count = bonusResult.charCount;
         (parsedBody as any).defender_coins_after = transferResult.defender_coins ?? null;
-        (parsedBody as any).attacker_coins_after = transferResult.attacker_coins ?? null;
+        (parsedBody as any).attacker_coins_after = attackerCoinsAfter;
         (parsedBody as any).defender_eliminated = transferResult.defender_eliminated ?? false;
       }
     }
@@ -594,6 +707,12 @@ export const POST: RequestHandler = async ({ params, request }) => {
         called_tools: Array.isArray(parsedObject?.tool_calls) ? parsedObject.tool_calls : [],
         outcome: attackSucceeded ? 'success' : 'failed',
         stolen_coins: stolenCoins,
+        base_coins: asFiniteNumber(parsedObject?.base_coins),
+        bonus_coins: asFiniteNumber(parsedObject?.bonus_coins),
+        elegance_factor: asFiniteNumber(parsedObject?.elegance_factor),
+        max_bonus: asFiniteNumber(parsedObject?.max_bonus),
+        turn_count: asFiniteNumber(parsedObject?.turn_count),
+        char_count: asFiniteNumber(parsedObject?.char_count),
         defender_coins_after: asFiniteNumber(parsedObject?.defender_coins_after),
         attacker_coins_after: asFiniteNumber(parsedObject?.attacker_coins_after),
         defender_eliminated: parsedObject?.defender_eliminated === true

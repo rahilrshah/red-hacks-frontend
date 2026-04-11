@@ -13,6 +13,7 @@
 
 <script lang="ts">
   import { page } from '$app/stores';
+  import { calculateAttackBonus, SOFT_CHAR_CAP, SOFT_TURN_CAP } from '$lib/bonus';
   import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
@@ -41,6 +42,22 @@
 
   let attackMode = $derived(resolveRoundType(roundInfo));
   const chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${defendedChallengeId}`);
+
+  // Client-side preview of the potential reward for the *next* attempt.
+  // Counts the user turns in the local chat + the currently-drafted prompt.
+  // Server re-computes authoritatively from the attacks table on success.
+  let potentialReward = $derived.by(() => {
+    const userMessages = messages.filter((m) => m.role === 'user');
+    const userTurns = userMessages.length;
+    const userChars = userMessages.reduce((acc, m) => acc + m.content.length, 0);
+    const draftChars = promptInput.length;
+    return calculateAttackBonus({
+      turnCount: userTurns + 1,
+      charCount: userChars + draftChars,
+      attackStealCoins: target?.challenges?.attack_steal_coins ?? 0,
+      defenseRewardCoins: target?.challenges?.defense_reward_coins ?? 0
+    });
+  });
 
   function sessionCacheKey() {
     return `${gameId}:${defendedChallengeId}`;
@@ -554,7 +571,25 @@
         </div>
 
         <div class="space-y-3">
-          <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Send Attack Prompt</p>
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <p class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Send Attack Prompt</p>
+            <div class="px-3 py-1.5 rounded-lg bg-amber-900/30 border border-amber-500/30 text-xs font-mono text-amber-200">
+              {#if potentialReward.base === 0}
+                Next attempt reward: <strong>0</strong> coins (no steal configured)
+              {:else if potentialReward.bonus > 0}
+                Next reward: <strong class="text-amber-100">{potentialReward.total}</strong>
+                = <strong>{potentialReward.base}</strong> base + <strong class="text-green-300">{potentialReward.bonus}</strong> bonus
+                <span class="text-amber-400/70">· elegance {Math.round(potentialReward.eleganceFactor * 100)}%</span>
+              {:else}
+                Next reward: <strong>{potentialReward.base}</strong> base only
+                <span class="text-amber-400/60">· elegance exhausted</span>
+              {/if}
+            </div>
+          </div>
+          <p class="text-[11px] text-gray-500 font-mono">
+            Bonus decays past {SOFT_TURN_CAP} turns or {SOFT_CHAR_CAP.toLocaleString()} total chars.
+            Approximate — server decides the final amount on success.
+          </p>
           <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-32 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm leading-relaxed" placeholder="> Continue attack conversation..."></textarea>
           <button onclick={sendPrompt} disabled={loading || !promptInput.trim()} class="bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold disabled:opacity-50 transition-all w-full uppercase">{loading ? 'SENDING...' : 'Send Prompt'}</button>
         </div>
@@ -573,6 +608,24 @@
           <div class="p-4 rounded-xl border {isSuccess ? 'bg-green-500/10 border-green-500/50 text-green-400' : isError ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-amber-500/10 border-amber-500/50 text-amber-300'}">
             <div class="font-black text-lg mb-2">{isSuccess ? '✅ TARGET COMPROMISED!' : isError ? '⚠️ ATTACK ERROR' : '↻ ATTEMPT COMPLETE - KEEP PUSHING'}</div>
             <div class="text-sm opacity-90 font-medium">{attackResult.message || attackResult.error || 'No compromise yet. Refine your prompt and try again.'}</div>
+            {#if isSuccess && typeof attackResult.bonus_coins === 'number' && attackResult.bonus_coins > 0}
+              <div class="mt-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs font-mono">
+                <div class="font-semibold">⚡ Elegance bonus: +{attackResult.bonus_coins} coins</div>
+                <div class="opacity-80 mt-1">
+                  {attackResult.base_coins ?? 0} base + {attackResult.bonus_coins} bonus = {attackResult.stolen_coins ?? 0} total
+                  {#if typeof attackResult.elegance_factor === 'number'}
+                    · elegance {Math.round(attackResult.elegance_factor * 100)}%
+                  {/if}
+                  {#if typeof attackResult.turn_count === 'number'}
+                    · {attackResult.turn_count} {attackResult.turn_count === 1 ? 'turn' : 'turns'}
+                  {/if}
+                </div>
+              </div>
+            {:else if isSuccess && typeof attackResult.base_coins === 'number'}
+              <div class="mt-3 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-gray-300 text-xs font-mono">
+                Base reward: {attackResult.base_coins} coins (elegance exhausted, no bonus)
+              </div>
+            {/if}
             {#if attackResult.log}
               <div class="mt-3 text-xs bg-black/60 p-3 rounded-lg text-gray-300 font-mono max-h-44 overflow-y-auto border border-white/5">{attackResult.log}</div>
             {/if}

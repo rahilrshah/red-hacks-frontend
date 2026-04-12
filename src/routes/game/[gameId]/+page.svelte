@@ -8,7 +8,7 @@
     type GameRound
   } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId ?? '');
   let game = $state<any>(null);
@@ -69,33 +69,36 @@
     userId = currentUser.user.id;
     await supabase.from('profiles').upsert({ id: userId, username: 'Player_' + userId.substring(0, 5) }, { onConflict: 'id' }).select();
 
-    const { data: gameRow } = await supabase
-      .from('games')
-      .select('id, name, invite_code, is_active, start_time, end_time')
-      .eq('id', gameId)
-      .maybeSingle();
+    await refreshGameAndRounds();
 
-    if (!gameRow) {
+    if (!game) {
       actionMessage = 'Game not found.';
       actionError = true;
       pageLoading = false;
       return;
     }
 
-    game = gameRow;
-
-    const { data: roundsData } = await supabase
-      .from('rounds')
-      .select('game_id, round_index, name, type, required_defenses, available_challenges, duration_minutes, intermission_minutes')
-      .eq('game_id', gameId)
-      .order('round_index', { ascending: true });
-
-    cachedRounds = (roundsData ?? []) as GameRound[];
-    tickRoundContext(); // first paint before the interval effect takes over
+    tickRoundContext();
 
     await fetchUserData();
     pageLoading = false;
   });
+
+  async function refreshGameAndRounds() {
+    const { data: gameRow } = await supabase
+      .from('games')
+      .select('id, name, invite_code, is_active, start_time, end_time')
+      .eq('id', gameId)
+      .maybeSingle();
+    if (gameRow) game = gameRow;
+
+    const { data: roundsData } = await supabase
+      .from('rounds')
+      .select('game_id, round_index, name, type, required_defenses, available_challenges, duration_minutes, intermission_minutes, is_enabled')
+      .eq('game_id', gameId)
+      .order('round_index', { ascending: true });
+    cachedRounds = (roundsData ?? []) as GameRound[];
+  }
 
   function tickRoundContext() {
     if (!game) return;
@@ -117,11 +120,23 @@
   // `cachedRounds` change, and the cleanup clears the previous interval.
   $effect(() => {
     if (!game) return;
-    // Read cachedRounds here so Svelte tracks it as a dependency.
     void cachedRounds;
     const handle = setInterval(tickRoundContext, 1000);
     return () => clearInterval(handle);
   });
+
+  // ---------- Realtime: re-fetch when admin changes game or rounds ----------
+
+  const realtimeChannel = supabase.channel(`game-hub:${gameId}`)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` },
+      () => { void refreshGameAndRounds(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
+      () => { void refreshGameAndRounds(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
+      () => { if (myTeam?.id) void fetchUserData(); })
+    .subscribe();
+
+  onDestroy(() => { supabase.removeChannel(realtimeChannel); });
 
   async function fetchUserData() {
     const { data: memberData } = await supabase

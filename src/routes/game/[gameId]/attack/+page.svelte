@@ -24,7 +24,7 @@
   import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId ?? '');
   let gameName = $state('');
@@ -427,10 +427,22 @@
     if (!restored) {
       void loadAttackTargets();
     } else {
-      // Even if restored from cache, we need the userId for attack invocations
       supabase.auth.getUser().then(({ data }) => { userId = data?.user?.id ?? ''; });
     }
   });
+
+  // ---------- Realtime: refresh targets when defenses or teams change ----------
+
+  const realtimeChannel = supabase.channel(`attack-targets:${gameId}`)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'defended_challenges' },
+      () => { void loadAttackTargets(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
+      () => { void loadAttackTargets(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
+      () => { void loadAttackTargets(); })
+    .subscribe();
+
+  onDestroy(() => { supabase.removeChannel(realtimeChannel); });
 </script>
 
 <div class="p-8 max-w-6xl mx-auto space-y-8">

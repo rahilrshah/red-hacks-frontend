@@ -8,7 +8,7 @@
     type GameRound
   } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId ?? '');
   let game = $state<any>(null);
@@ -127,16 +127,34 @@
 
   // ---------- Realtime: re-fetch when admin changes game or rounds ----------
 
-  const realtimeChannel = supabase.channel(`game-hub:${gameId}`)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` },
-      () => { void refreshGameAndRounds(); })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
-      () => { void refreshGameAndRounds(); })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
-      () => { if (myTeam?.id) void fetchUserData(); })
-    .subscribe();
+  $effect(() => {
+    if (!gameId) return;
 
-  onDestroy(() => { supabase.removeChannel(realtimeChannel); });
+    const realtimeChannel = supabase
+      .channel(`game-hub:${gameId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` },
+        () => {
+          void refreshGameAndRounds();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
+        () => {
+          void refreshGameAndRounds();
+        }
+      )
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, () => {
+        if (myTeam?.id) void fetchUserData();
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(realtimeChannel);
+    };
+  });
 
   async function fetchUserData() {
     const { data: memberData } = await supabase

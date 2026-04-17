@@ -19,12 +19,13 @@
 </script>
 
 <script lang="ts">
+  import { PUBLIC_MAX_UPLOAD_MB } from '$env/static/public';
   import { page } from '$app/stores';
   import { calculateAttackBonus, SOFT_CHAR_CAP, SOFT_TURN_CAP } from '$lib/bonus';
   import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
   import { supabase } from '$lib/supabaseClient';
-  import { onDestroy, onMount } from 'svelte';
+  import { onMount } from 'svelte';
 
   let gameId = $derived($page.params.gameId ?? '');
   let gameName = $state('');
@@ -41,9 +42,15 @@
   let messages = $state<AttackMessage[]>([]);
   let promptInput = $state('');
   let secretKeyGuess = $state('');
+  let selectedFiles = $state<File[]>([]);
+  let attachmentError = $state('');
   let chatLoading = $state(false);
   let attackResult = $state<any>(null);
   let userId = $state('');
+
+  const parsedMaxUploadMb = Number(PUBLIC_MAX_UPLOAD_MB || 10);
+  const MAX_UPLOAD_MB = Number.isFinite(parsedMaxUploadMb) && parsedMaxUploadMb > 0 ? Math.trunc(parsedMaxUploadMb) : 10;
+  const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
   let selectedTarget = $derived(challenges.find((c: any) => c.id === selectedChallengeId) ?? null);
   let chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${selectedChallengeId}`);
@@ -141,6 +148,32 @@
     localStorage.setItem(chatStorageKey, JSON.stringify(messages));
   }
 
+  function formatFileSize(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function validateFiles(files: File[]) {
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > MAX_UPLOAD_BYTES) {
+      return `Attached files exceed the ${MAX_UPLOAD_MB} MB limit.`;
+    }
+
+    return '';
+  }
+
+  function handleFileSelection(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    selectedFiles = Array.from(input.files ?? []);
+    attachmentError = validateFiles(selectedFiles);
+  }
+
+  function clearAttachments() {
+    selectedFiles = [];
+    attachmentError = '';
+  }
+
   function clearChatHistory() {
     if (!confirm('Are you sure you want to clear chat?\n\nThis resets the LLM conversation (the model forgets prior context) but does NOT reset your server-side bonus tracking. Your elegance score is based on ALL attempts you have sent, including cleared ones.')) {
       return;
@@ -206,6 +239,7 @@
       attackResult = null;
       promptInput = '';
       secretKeyGuess = '';
+      clearAttachments();
       serverTurnCount = null;
       serverCharCount = null;
     }
@@ -262,14 +296,30 @@
       return;
     }
 
+    const selectedFilesError = validateFiles(selectedFiles);
+    if (selectedFilesError) {
+      attachmentError = selectedFilesError;
+      attackResult = { success: false, error: selectedFilesError };
+      return;
+    }
+
     const payload = buildAttackPayload(args);
     let responseData: any = null;
 
     try {
+      const formData = new FormData();
+      for (const [key, value] of Object.entries(payload)) {
+        formData.set(key, typeof value === 'string' ? value : JSON.stringify(value));
+      }
+
+      for (const file of selectedFiles) {
+        formData.append('attachments', file, file.name);
+      }
+
       const response = await fetch(`/game/${gameId}/attack`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify(payload)
+        headers: { Authorization: `Bearer ${accessToken}` },
+        body: formData
       });
       const responseText = await response.text();
       try { responseData = responseText ? JSON.parse(responseText) : null; } catch { responseData = responseText; }
@@ -433,16 +483,30 @@
 
   // ---------- Realtime: refresh targets when defenses or teams change ----------
 
-  const realtimeChannel = supabase.channel(`attack-targets:${gameId}`)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'defended_challenges' },
-      () => { void loadAttackTargets(); })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' },
-      () => { void loadAttackTargets(); })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
-      () => { void loadAttackTargets(); })
-    .subscribe();
+  $effect(() => {
+    if (!gameId) return;
 
-  onDestroy(() => { supabase.removeChannel(realtimeChannel); });
+    const realtimeChannel = supabase
+      .channel(`attack-targets:${gameId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'defended_challenges' }, () => {
+        void loadAttackTargets();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, () => {
+        void loadAttackTargets();
+      })
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'rounds', filter: `game_id=eq.${gameId}` },
+        () => {
+          void loadAttackTargets();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(realtimeChannel);
+    };
+  });
 </script>
 
 <div class="p-8 max-w-6xl mx-auto space-y-8">
@@ -582,8 +646,34 @@
             </div>
           </div>
           <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-24 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm" placeholder="> Type your attack prompt..."></textarea>
+          <div class="space-y-2 rounded-xl border border-dashed border-white/15 bg-black/30 p-4">
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <p class="text-sm font-semibold text-gray-200">Attach files</p>
+                <p class="text-xs text-gray-500">Text attachments only for now. Total limit: {MAX_UPLOAD_MB} MB.</p>
+              </div>
+              <button type="button" onclick={clearAttachments} class="text-xs text-gray-400 hover:text-white transition-colors" disabled={selectedFiles.length === 0}>Clear attachments</button>
+            </div>
+            <input
+              type="file"
+              multiple
+              accept=".txt,.md,.csv,.json,.log,text/plain,text/markdown,text/csv,application/json"
+              onchange={handleFileSelection}
+              class="block w-full text-sm text-gray-300 file:mr-4 file:rounded-lg file:border-0 file:bg-red-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:bg-red-500"
+            />
+            {#if selectedFiles.length > 0}
+              <div class="flex flex-wrap gap-2 text-xs text-gray-300">
+                {#each selectedFiles as file}
+                  <span class="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono">{file.name} · {formatFileSize(file.size)}</span>
+                {/each}
+              </div>
+            {/if}
+            {#if attachmentError}
+              <p class="text-xs text-red-300">{attachmentError}</p>
+            {/if}
+          </div>
           <div class="flex gap-3">
-            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim()} class="flex-1 bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold disabled:opacity-50 transition-all uppercase">
+            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim() || !!attachmentError} class="flex-1 bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold disabled:opacity-50 transition-all uppercase">
               {chatLoading ? 'SENDING...' : 'Send Prompt'}
             </button>
           </div>

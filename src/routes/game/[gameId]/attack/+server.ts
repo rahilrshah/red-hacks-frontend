@@ -1,5 +1,5 @@
 import { env } from '$env/dynamic/private';
-import { PUBLIC_SUPABASE_URL } from '$env/static/public';
+import { PUBLIC_MAX_UPLOAD_MB, PUBLIC_SUPABASE_URL } from '$env/static/public';
 import { calculateAttackBonus, type AttackBonusResult } from '$lib/bonus';
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient } from '@supabase/supabase-js';
@@ -29,7 +29,24 @@ type AttackRequestBody = {
   prompt?: string;
   guess?: string;
   messages?: Array<{ role?: string; content?: string }>;
+  attachments?: Array<{
+    name?: string;
+    type?: string;
+    size?: number;
+    content?: string;
+  }>;
+  challenge?: unknown;
 };
+
+type AttachmentSummary = {
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  content: string;
+};
+
+const DEFAULT_MAX_UPLOAD_MB = 10;
+const ATTACHMENT_CONTEXT_CHAR_LIMIT = 12000;
 
 function createSupabaseAdminClient() {
   const supabaseUrl = PUBLIC_SUPABASE_URL;
@@ -62,6 +79,109 @@ function normalizeMessages(messages: unknown): ChatMessage[] {
       content: typeof message.content === 'string' ? message.content : ''
     }))
     .filter((message) => ['system', 'user', 'assistant', 'tool'].includes(message.role) && message.content.length > 0);
+}
+
+function parseNumericEnv(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return Math.trunc(parsed);
+}
+
+function getMaxUploadBytes() {
+  const configuredMb = parseNumericEnv(env.MAX_UPLOAD_MB || PUBLIC_MAX_UPLOAD_MB, DEFAULT_MAX_UPLOAD_MB);
+  return configuredMb * 1024 * 1024;
+}
+
+function safeJsonParse<T>(value: string, fallback: T): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeAttachmentSummaries(attachments: unknown): AttachmentSummary[] {
+  if (!Array.isArray(attachments)) return [];
+
+  return attachments
+    .filter((attachment) => attachment && typeof attachment === 'object')
+    .map((attachment: any) => ({
+      name: typeof attachment.name === 'string' && attachment.name.trim().length > 0 ? attachment.name.trim() : 'attachment',
+      mimeType: typeof attachment.type === 'string' && attachment.type.trim().length > 0 ? attachment.type.trim() : 'application/octet-stream',
+      sizeBytes: Number.isFinite(Number(attachment.size)) ? Math.max(0, Math.trunc(Number(attachment.size))) : 0,
+      content: typeof attachment.content === 'string' ? attachment.content : ''
+    }))
+    .filter((attachment) => attachment.content.length > 0 || attachment.sizeBytes > 0);
+}
+
+function buildAttachmentContext(attachments: AttachmentSummary[]): string {
+  if (attachments.length === 0) {
+    return '';
+  }
+
+  const parts = attachments.map((attachment) => {
+    const trimmedContent = attachment.content.slice(0, ATTACHMENT_CONTEXT_CHAR_LIMIT);
+    const contentBlock = trimmedContent.length > 0 ? `\n${trimmedContent}` : '';
+    const truncatedSuffix = attachment.content.length > trimmedContent.length ? '\n[Attachment content truncated]' : '';
+    return `[Attachment: ${attachment.name} | ${attachment.mimeType} | ${attachment.sizeBytes} bytes]${contentBlock}${truncatedSuffix}`;
+  });
+
+  return `Uploaded attachments:\n${parts.join('\n\n')}`;
+}
+
+function mergePromptWithAttachments(prompt: string, attachments: AttachmentSummary[]): string {
+  const attachmentContext = buildAttachmentContext(attachments);
+  return [prompt.trim(), attachmentContext].filter((part) => part.length > 0).join('\n\n');
+}
+
+async function parseAttackRequestBody(request: Request): Promise<AttackRequestBody> {
+  const contentType = request.headers.get('content-type') ?? '';
+
+  if (contentType.includes('multipart/form-data')) {
+    const formData = await request.formData();
+    const getString = (key: string) => {
+      const value = formData.get(key);
+      return typeof value === 'string' ? value : '';
+    };
+
+    const attachments: AttachmentSummary[] = [];
+    const attachmentEntries = formData.getAll('attachments');
+    const maxUploadBytes = getMaxUploadBytes();
+    let totalBytes = 0;
+
+    for (const entry of attachmentEntries) {
+      if (!(entry instanceof File)) continue;
+      totalBytes += entry.size;
+
+      if (entry.size > maxUploadBytes || totalBytes > maxUploadBytes) {
+        throw new Error(`Attached files exceed the ${parseNumericEnv(env.MAX_UPLOAD_MB || PUBLIC_MAX_UPLOAD_MB, DEFAULT_MAX_UPLOAD_MB)} MB limit.`);
+      }
+
+      const content = await entry.text();
+      attachments.push({
+        name: entry.name || 'attachment',
+        mimeType: entry.type || 'application/octet-stream',
+        sizeBytes: entry.size,
+        content: content.slice(0, ATTACHMENT_CONTEXT_CHAR_LIMIT)
+      });
+    }
+
+    return {
+      defended_challenge_id: getString('defended_challenge_id') || undefined,
+      challenge_id: getString('challenge_id') || undefined,
+      game_id: getString('game_id') || undefined,
+      prompt: getString('prompt') || undefined,
+      guess: getString('guess') || undefined,
+      messages: safeJsonParse(getString('messages'), [] as Array<{ role?: string; content?: string }>),
+      challenge: safeJsonParse(getString('challenge'), null),
+      attachments
+    };
+  }
+
+  return (await request.json()) as AttackRequestBody;
 }
 
 function asValidDateMs(value: string | null | undefined): number | null {
@@ -153,10 +273,23 @@ async function parseResponseBody(response: Response) {
 }
 
 function buildAttackRequestPayload(body: AttackRequestBody, targetDetails: any, challengeId: string, targetSecretKey: string | null) {
+  const attachmentSummaries = normalizeAttachmentSummaries(body.attachments);
+  const mergedPrompt = mergePromptWithAttachments(body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || '', attachmentSummaries);
+  const normalizedMessages = normalizeMessages(body.messages);
+  const messagesWithAttachments = normalizedMessages.length > 0
+    ? [...normalizedMessages.slice(0, -1), { ...normalizedMessages.at(-1)!, content: mergedPrompt }]
+    : (mergedPrompt ? [{ role: 'user', content: mergedPrompt }] : []);
+
   const payload: Record<string, unknown> = {
-    prompt: body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || '',
+    prompt: mergedPrompt,
     guess: body.guess?.trim() || '',
-    messages: normalizeMessages(body.messages),
+    messages: messagesWithAttachments,
+    attachments: attachmentSummaries.map((attachment) => ({
+      name: attachment.name,
+      type: attachment.mimeType,
+      size: attachment.sizeBytes,
+      content: attachment.content
+    })),
     challenge: buildResolvedChallengePayload(targetDetails, challengeId, targetSecretKey)
   };
 
@@ -327,7 +460,7 @@ export const POST: RequestHandler = async ({ params, request }) => {
       return json({ success: false, error: 'Unauthorized: valid JWT required' }, { status: 401 });
     }
 
-    const body = (await request.json()) as AttackRequestBody;
+    const body = await parseAttackRequestBody(request);
     const gameId = params.gameId;
     const requestedGameId = typeof body.game_id === 'string' && body.game_id.trim().length > 0 ? body.game_id.trim() : gameId;
 

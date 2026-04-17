@@ -12,7 +12,10 @@ node_modules
 .DS_Store
 Thumbs.db
 
+__pycache__
+
 # Env
+.venv
 .env
 .env.*
 !.env.example

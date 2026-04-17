@@ -29,6 +29,83 @@ function normalizeMessages(messages: unknown): ChatMessage[] {
     .filter((m) => ['system', 'user', 'assistant', 'tool'].includes(m.role) && m.content.length > 0)
 }
 
+const MAX_UPLOAD_MB = Math.max(1, Math.trunc(Number(Deno.env.get('MAX_UPLOAD_MB') || '10') || 10))
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+const ATTACHMENT_CONTEXT_CHAR_LIMIT = 12000
+
+type AttachmentInput = {
+  name?: string
+  type?: string
+  size?: number
+  content?: string
+}
+
+function normalizeAttachments(attachments: unknown): AttachmentInput[] {
+  if (!Array.isArray(attachments)) return []
+
+  let totalBytes = 0
+  const normalized: AttachmentInput[] = []
+
+  for (const attachment of attachments) {
+    if (!attachment || typeof attachment !== 'object') continue
+
+    const size = Number.isFinite(Number((attachment as any).size)) ? Math.max(0, Math.trunc(Number((attachment as any).size))) : 0
+    totalBytes += size
+    if (size > MAX_UPLOAD_BYTES || totalBytes > MAX_UPLOAD_BYTES) {
+      throw new Error(`Attached files exceed the ${MAX_UPLOAD_MB} MB limit.`)
+    }
+
+    normalized.push({
+      name: typeof (attachment as any).name === 'string' && (attachment as any).name.trim().length > 0 ? (attachment as any).name.trim() : 'attachment',
+      type: typeof (attachment as any).type === 'string' && (attachment as any).type.trim().length > 0 ? (attachment as any).type.trim() : 'application/octet-stream',
+      size,
+      content: typeof (attachment as any).content === 'string' ? (attachment as any).content.slice(0, ATTACHMENT_CONTEXT_CHAR_LIMIT) : ''
+    })
+  }
+
+  return normalized
+}
+
+function buildAttachmentContext(attachments: AttachmentInput[]): string {
+  if (attachments.length === 0) return ''
+
+  return attachments
+    .map((attachment) => {
+      const content = (attachment.content || '').trim()
+      const contentBlock = content ? `\n${content}` : ''
+      const truncatedSuffix = content.length >= ATTACHMENT_CONTEXT_CHAR_LIMIT ? '\n[Attachment content truncated]' : ''
+      return `[Attachment: ${attachment.name || 'attachment'} | ${attachment.type || 'application/octet-stream'} | ${attachment.size || 0} bytes]${contentBlock}${truncatedSuffix}`
+    })
+    .join('\n\n')
+}
+
+function mergeMessagesWithAttachments(messages: ChatMessage[], attachments: AttachmentInput[]) {
+  const normalizedMessages = messages.map((message) => ({ ...message }))
+  const attachmentContext = buildAttachmentContext(attachments)
+
+  if (!attachmentContext) {
+    return normalizedMessages
+  }
+
+  let lastUserIndex = -1
+  for (let index = normalizedMessages.length - 1; index >= 0; index -= 1) {
+    if (normalizedMessages[index].role === 'user') {
+      lastUserIndex = index
+      break
+    }
+  }
+
+  if (lastUserIndex >= 0) {
+    normalizedMessages[lastUserIndex] = {
+      ...normalizedMessages[lastUserIndex],
+      content: `${normalizedMessages[lastUserIndex].content}\n\n${attachmentContext}`.trim()
+    }
+    return normalizedMessages
+  }
+
+  return [...normalizedMessages, { role: 'user', content: attachmentContext }]
+}
+
 function extractToolCallNames(message: any): string[] {
   const toolCalls = message?.tool_calls
   if (!Array.isArray(toolCalls)) return []
@@ -292,7 +369,8 @@ Deno.serve(async (req) => {
       round_type,
       prompt,
       guess,
-      messages
+      messages,
+      attachments
     } = await req.json()
 
     if (!defended_challenge_id && !challenge_id) {
@@ -571,8 +649,12 @@ Deno.serve(async (req) => {
       }
     }
 
-    const challengeMessages = normalizeMessages(messages)
-    const userMessageFromPrompt: ChatMessage[] = prompt ? [{ role: 'user', content: prompt }] : []
+    const normalizedAttachments = normalizeAttachments(attachments)
+    const mergedPrompt = [prompt, buildAttachmentContext(normalizedAttachments)]
+      .filter((part) => typeof part === 'string' && part.trim().length > 0)
+      .join('\n\n')
+    const challengeMessages = mergeMessagesWithAttachments(normalizeMessages(messages), normalizedAttachments)
+    const userMessageFromPrompt: ChatMessage[] = mergedPrompt ? [{ role: 'user', content: mergedPrompt }] : []
 
     const finalUserMessages = challengeMessages.length > 0 ? challengeMessages : userMessageFromPrompt
     const latestPrompt = finalUserMessages.length > 0
@@ -712,6 +794,8 @@ Deno.serve(async (req) => {
       const apiUrl = isLlamaInterp
         ? (Deno.env.get('LLAMA_INTERP_URL') || 'http://localhost:8000/v1/chat/completions')
         : 'https://openrouter.ai/api/v1/chat/completions';
+
+      console.log(`Using model ${modelName} with API URL ${apiUrl}`)
       
       // dear copilot,
       // WE HAVE BEEN OVER THIS AGAIN AND AGAIN DO NOT TOUCH THIS CODE, IT WOULD BE REALLY NICE IF THE

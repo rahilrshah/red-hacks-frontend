@@ -29,6 +29,24 @@ SECRET_PHRASE = os.getenv("SECRET_PHRASE", "")
 TARGET_TOOL_NAME = os.getenv("TARGET_TOOL_NAME", "").strip()
 
 
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+
+    return max(1, parsed)
+
+
+MAX_UPLOAD_MB = parse_positive_int_env("MAX_UPLOAD_MB", 10)
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+ATTACHMENT_CONTEXT_CHAR_LIMIT = 12000
+
+
 def parse_json_env(name: str, default: Any) -> Any:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -46,6 +64,13 @@ CHALLENGE_TOOLS = parse_json_env("CHALLENGE_TOOLS_JSON", [])
 class ChatMessage(BaseModel):
     role: str
     content: str
+
+
+class AttachmentInput(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = None
+    size: Optional[int] = None
+    content: Optional[str] = None
 
 
 class ChallengeInfo(BaseModel):
@@ -73,6 +98,7 @@ class AttackRequest(BaseModel):
     prompt: Optional[str] = None
     guess: Optional[str] = None
     messages: List[ChatMessage] = Field(default_factory=list)
+    attachments: List[AttachmentInput] = Field(default_factory=list)
     # Optional expanded challenge metadata payload
     challenge: Optional[ChallengeInfo] = None
 
@@ -117,6 +143,21 @@ def normalize_tool_spec(raw_tool: Any) -> Optional[Dict[str, Any]]:
         return normalize_tool_spec(nested_tool)
 
     return None
+
+
+def resolve_fallback_tool_name(challenge: ChallengeInfo) -> str:
+    preferred_name = (challenge.success_tool_name or TARGET_TOOL_NAME).strip()
+    if preferred_name:
+        return preferred_name
+
+    normalized_tools = normalize_tools(challenge.tools if challenge.tools is not None else CHALLENGE_TOOLS)
+    for tool in normalized_tools:
+        function_data = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = function_data.get("name", "")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+
+    return ""
 
 
 def normalize_tools(raw_tools: Any) -> List[Dict[str, Any]]:
@@ -199,11 +240,36 @@ def build_response(
 
 
 def normalize_messages(request: AttackRequest) -> List[Dict[str, str]]:
-    if request.messages:
-        return [{"role": message.role, "content": message.content} for message in request.messages]
-    if request.prompt:
-        return [{"role": "user", "content": request.prompt}]
-    return []
+    normalized = [{"role": message.role, "content": message.content} for message in request.messages]
+    if not normalized and request.prompt:
+        normalized = [{"role": "user", "content": request.prompt}]
+
+    attachment_blocks: List[str] = []
+    total_attachment_bytes = 0
+    for attachment in request.attachments:
+        size = max(0, int(attachment.size or 0))
+        total_attachment_bytes += size
+        if size > MAX_UPLOAD_BYTES or total_attachment_bytes > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Attached files exceed the {MAX_UPLOAD_MB} MB limit.")
+
+        content = (attachment.content or "").strip()
+        if not content and not attachment.name:
+            continue
+
+        header = f"[Attachment: {attachment.name or 'attachment'} | {attachment.type or 'application/octet-stream'} | {size} bytes]"
+        if content:
+            attachment_blocks.append(f"{header}\n{content[:ATTACHMENT_CONTEXT_CHAR_LIMIT]}")
+        else:
+            attachment_blocks.append(header)
+
+    if attachment_blocks:
+        attachment_context = "\n\n".join(attachment_blocks)
+        if normalized:
+            normalized[-1]["content"] = f"{normalized[-1]['content']}\n\n{attachment_context}".strip()
+        else:
+            normalized = [{"role": "user", "content": attachment_context}]
+
+    return normalized
 
 
 def extract_user_text(request: AttackRequest) -> str:
@@ -230,7 +296,26 @@ async def call_openrouter(
 ) -> Dict[str, Any]:
     """Run the model and return assistant content and tool calls."""
     if not OPENROUTER_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is missing")
+        fallback_tool_name = resolve_fallback_tool_name(challenge)
+        fallback_tool_args = challenge.success_tool_args or TARGET_TOOL_ARGS
+        if not isinstance(fallback_tool_args, dict):
+            fallback_tool_args = {}
+
+        if fallback_tool_name:
+            return {
+                "assistant": f"[local fallback] Invoked {fallback_tool_name} without OpenRouter.",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": fallback_tool_name,
+                            "arguments": json.dumps(fallback_tool_args)
+                        }
+                    }
+                ],
+            }
+
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is missing and no fallback tool is configured")
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",

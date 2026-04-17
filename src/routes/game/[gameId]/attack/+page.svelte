@@ -54,6 +54,67 @@
 
   let selectedTarget = $derived(challenges.find((c: any) => c.id === selectedChallengeId) ?? null);
   let selectedTargetCompromised = $derived(selectedTarget?.compromised_by_me === true);
+
+  // Locked = user cannot take any attack action on the current target until
+  // they click Attack Again (or the target is permanently compromised).
+  // Triggered by: compromised target, judge verdict returned, escalation pending,
+  // or a non-judge success flag still in attackResult.
+  let attackLocked = $derived.by(() => {
+    if (selectedTargetCompromised) return true;
+    if (!attackResult) return false;
+    if (typeof attackResult.verdict === 'string') return true;
+    if (attackResult.escalated === true) return true;
+    if (attackResult.success === true && attackResult.verdict === undefined) return true;
+    return false;
+  });
+
+  // Attack Again is only meaningful when the user has a finished verdict
+  // below 'full'. Full = permanent lockout (compromised). Pending escalation
+  // waits on the admin — no button. Non-judge success also compromises.
+  let canAttackAgain = $derived.by(() => {
+    if (selectedTargetCompromised) return false;
+    if (!attackResult) return false;
+    if (attackResult.escalated === true) return false;
+    if (attackResult.verdict === 'full') return false;
+    if (typeof attackResult.verdict === 'string') return true;
+    return false;
+  });
+
+  function attackAckKey(attackId: string): string {
+    return `attack-ack:${attackId}`;
+  }
+
+  // Backed by localStorage for persistence across reloads, but mirrored into
+  // a reactive $state Set so UI badges (target panel verdict pills) refresh
+  // the instant the user clicks Attack Again. Hydrated on mount.
+  let ackedAttackIds = $state(new Set<string>());
+
+  function hydrateAckedFromStorage() {
+    try {
+      const ids = new Set<string>();
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith('attack-ack:')) continue;
+        if (localStorage.getItem(key) === '1') {
+          ids.add(key.slice('attack-ack:'.length));
+        }
+      }
+      ackedAttackIds = ids;
+    } catch {}
+  }
+
+  function markAttackAcked(attackId: string | null | undefined) {
+    if (!attackId) return;
+    try { localStorage.setItem(attackAckKey(attackId), '1'); } catch {}
+    const next = new Set(ackedAttackIds);
+    next.add(attackId);
+    ackedAttackIds = next;
+  }
+
+  function isAttackAcked(attackId: string | null | undefined): boolean {
+    if (!attackId) return false;
+    return ackedAttackIds.has(attackId);
+  }
   let chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${selectedChallengeId}`);
 
   // Reward preview is fully server-driven. We never use the local messages
@@ -280,6 +341,9 @@
       serverCharCount = null;
       // Fire-and-forget: populates serverTurnCount in the background.
       void refreshServerTurnCount();
+      // Pull any pending or resolved escalation for this (team, target) pair
+      // so admin verdicts that landed between visits appear on page load.
+      void loadEscalationForTarget();
     }
   });
 
@@ -484,18 +548,144 @@
 
       attackResult = data;
 
-      // Clear local chat after settlement so the next attempt starts fresh
-      // (server has persisted the verdict). Skip clear if escalated so the
-      // attacker can review what they submitted.
-      if (data?.escalated !== true) {
-        messages = [];
-        if (chatStorageKey) localStorage.removeItem(chatStorageKey);
+      // After any judge verdict (or pending escalation) the buttons lock.
+      // The user drives the state transition with the Attack Again button,
+      // not auto-clear. Full verdicts flag the target permanently compromised.
+      if (data?.verdict === 'full' && selectedChallengeId) {
+        challenges = challenges.map((c: any) =>
+          c.id === selectedChallengeId ? { ...c, compromised_by_me: true } : c
+        );
       }
+      // Refresh the server-side bonus window so Attack Again picks up the
+      // advanced windowStart immediately when the user chooses to retry.
+      void refreshServerTurnCount();
     } catch (err: any) {
       attackResult = { success: false, error: err?.message || 'Unexpected error ending attack.' };
     } finally {
       chatLoading = false;
     }
+  }
+
+  // Enter submits, Shift+Enter (or IME composition) inserts a newline.
+  function handlePromptKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return;
+    if (event.shiftKey) return;
+    if (event.isComposing) return;
+    event.preventDefault();
+    if (chatLoading) return;
+    if (!promptInput.trim()) return;
+    if (attachmentError) return;
+    if (attackLocked) return;
+    void sendPrompt();
+  }
+
+  // Attack Again: wipe chat + acknowledge the current verdict so we don't
+  // re-surface it on the next target switch. Refresh server windowing so the
+  // bonus preview drops back to turn 1.
+  function attackAgain() {
+    markAttackAcked(attackResult?.attack_id);
+    messages = [];
+    if (chatStorageKey) localStorage.removeItem(chatStorageKey);
+    attackResult = null;
+    void refreshServerTurnCount();
+  }
+
+  // Pull the most recent pending-or-resolved escalation for this target and
+  // surface it so the attacker can see admin rulings that came in while they
+  // were away. Non-escalation verdicts are intentionally skipped — the user
+  // saw those live and clicked Attack Again, so showing them again is noise.
+  function mapAttackRowToResult(row: any) {
+    const log = (row.log && typeof row.log === 'object') ? row.log : {};
+    if (row.escalation_status === 'pending') {
+      return {
+        attack_id: row.id,
+        success: false,
+        escalated: true,
+        message: 'Attack submitted for admin review. Coins held in escrow pending decision.',
+        escrow_amount: row.escrow_amount ?? log.escrow_amount ?? 0,
+        max_potential_total: log.max_potential_total,
+        judge_reason: row.judge_reason
+      };
+    }
+    if (row.judge_verdict) {
+      return {
+        attack_id: row.id,
+        success: (row.judge_coefficient ?? 0) > 0,
+        verdict: row.judge_verdict,
+        coefficient: row.judge_coefficient,
+        judge_reason: row.judge_reason,
+        stolen_coins: log.attacker_payout ?? log.stolen_coins,
+        base_coins: log.base_coins,
+        bonus_coins: log.bonus_coins,
+        elegance_factor: log.elegance_factor,
+        max_bonus: log.max_bonus,
+        turn_count: log.turn_count,
+        char_count: log.char_count,
+        resolved_by_admin: row.escalation_status === 'resolved',
+        admin_note: typeof log.admin_note === 'string' ? log.admin_note : null
+      };
+    }
+    // Non-judge success (secret-key / tool-calling / keyword). Fill the same
+    // fields the green "TARGET COMPROMISED!" banner consumes so it renders
+    // identically on return visits, including the final payout breakdown and
+    // the assistant's last reply.
+    return {
+      attack_id: row.id,
+      success: row.is_successful === true,
+      assistant: typeof log.assistant_message === 'string' ? log.assistant_message : null,
+      message: 'Target compromised.',
+      stolen_coins: log.stolen_coins,
+      base_coins: log.base_coins,
+      bonus_coins: log.bonus_coins,
+      elegance_factor: log.elegance_factor,
+      max_bonus: log.max_bonus,
+      turn_count: log.turn_count,
+      char_count: log.char_count,
+      log: typeof log.backend_log === 'string' ? log.backend_log : null
+    };
+  }
+
+  async function loadEscalationForTarget() {
+    if (!selectedChallengeId || !userId) return;
+    if (attackMode !== 'pvp') return;
+    const teamId = await getMyTeamId();
+    if (!teamId) return;
+
+    // Pull the most recent "terminal" attack row for this (team, target):
+    // judge_verdict set (any verdict, escalation, or admin-resolved) OR
+    // non-judge success (is_successful=true with no verdict). The isAttackAcked
+    // gate below filters out results the user already dismissed via Attack
+    // Again, so normal non-judge compromises stay visible on return visits
+    // but cleared-by-user ones don't resurface.
+    const isJudge = selectedTarget?.challenges?.type === 'judge';
+    let query = supabase
+      .from('attacks')
+      .select('id, judge_verdict, judge_coefficient, judge_reason, escalation_status, escrow_amount, is_successful, log, created_at')
+      .eq('attacker_team_id', teamId)
+      .eq('defended_challenge_id', selectedChallengeId);
+    if (isJudge) {
+      query = query.not('judge_verdict', 'is', null);
+    } else {
+      query = query.eq('is_successful', true).is('judge_verdict', null);
+    }
+    const { data } = await query
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!data) return;
+    if (isAttackAcked(data.id)) return;
+    // Skip redundant updates: if the in-memory attackResult already points
+    // at this row AND the server state hasn't advanced from pending to
+    // resolved, nothing to do. The pending→resolved promotion is exactly
+    // the transition we need to surface on admin rulings, so let it through.
+    if (attackResult && attackResult.attack_id === data.id) {
+      const pendingInCache = attackResult.escalated === true;
+      const pendingOnServer = data.escalation_status === 'pending';
+      if (!(pendingInCache && !pendingOnServer)) return;
+    }
+
+    attackResult = mapAttackRowToResult(data);
   }
 
   function formatTime(isoText: string) {
@@ -573,22 +763,39 @@
           .neq('team_id', myTeamId);
         if (error) { statusError = error.message; return; }
 
-        // Flag targets this team has already compromised. Server also blocks
-        // re-attacks; we tag them here so the UI can mark them "compromised"
-        // and gray out the action buttons rather than hiding them.
+        // Flag targets this team has already compromised, and capture the
+        // most-recent judge verdict per target so the panel can show the
+        // outcome badge instead of stale "In Progress" state.
         const { data: myAttacks } = await supabase
           .from('attacks')
-          .select('defended_challenge_id, judge_verdict, is_successful')
+          .select('id, defended_challenge_id, judge_verdict, is_successful, escalation_status, created_at')
           .eq('attacker_team_id', myTeamId)
-          .not('defended_challenge_id', 'is', null);
-        const compromisedIds = new Set(
-          (myAttacks ?? [])
-            .filter((row: any) => row.judge_verdict ? row.judge_verdict === 'full' : row.is_successful === true)
-            .map((row: any) => row.defended_challenge_id)
-        );
+          .not('defended_challenge_id', 'is', null)
+          .order('created_at', { ascending: false });
+
+        const compromisedIds = new Set<string>();
+        const latestVerdictByTarget = new Map<string, { attack_id: string; verdict: string; escalation_status: string | null }>();
+
+        for (const row of myAttacks ?? []) {
+          const targetId = row.defended_challenge_id as string;
+          if (row.judge_verdict ? row.judge_verdict === 'full' : row.is_successful === true) {
+            compromisedIds.add(targetId);
+          }
+          if (row.judge_verdict && !latestVerdictByTarget.has(targetId)) {
+            latestVerdictByTarget.set(targetId, {
+              attack_id: row.id,
+              verdict: row.judge_verdict,
+              escalation_status: row.escalation_status ?? null
+            });
+          }
+        }
 
         challenges = (data ?? [])
-          .map((row: any) => ({ ...row, compromised_by_me: compromisedIds.has(row.id) }))
+          .map((row: any) => ({
+            ...row,
+            compromised_by_me: compromisedIds.has(row.id),
+            latest_attempt: latestVerdictByTarget.get(row.id) ?? null
+          }))
           .sort((a: any, b: any) => {
             if (a.compromised_by_me !== b.compromised_by_me) {
               return Number(a.compromised_by_me) - Number(b.compromised_by_me);
@@ -621,6 +828,7 @@
   }
 
   onMount(() => {
+    hydrateAckedFromStorage();
     const restored = restoreFromCache();
     if (!restored) {
       void loadAttackTargets();
@@ -649,6 +857,12 @@
           void loadAttackTargets();
         }
       )
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'attacks' }, () => {
+        // Catches admin escalation resolutions: when the admin rules on a
+        // pending escalation, the attacks row gets its judge_verdict filled
+        // in. Re-run the escalation loader so the attacker sees it live.
+        void loadEscalationForTarget();
+      })
       .subscribe();
 
     return () => {
@@ -693,6 +907,19 @@
               {target.teams?.name || 'Default Defense'}
               {#if target.compromised_by_me}
                 <span class="text-[10px] font-normal uppercase tracking-wider text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 rounded">Compromised</span>
+              {:else if target.latest_attempt && !isAttackAcked(target.latest_attempt.attack_id)}
+                {@const att = target.latest_attempt}
+                {#if att.escalation_status === 'pending'}
+                  <span class="text-[10px] font-normal uppercase tracking-wider text-amber-300 border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 rounded">Awaiting Review</span>
+                {:else if att.verdict === 'none'}
+                  <span class="text-[10px] font-normal uppercase tracking-wider text-red-300 border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 rounded">Verdict: None</span>
+                {:else if att.verdict === 'structural'}
+                  <span class="text-[10px] font-normal uppercase tracking-wider text-amber-300 border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 rounded">Verdict: Structural</span>
+                {:else if att.verdict === 'partial'}
+                  <span class="text-[10px] font-normal uppercase tracking-wider text-amber-300 border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 rounded">Verdict: Partial</span>
+                {:else if att.verdict === 'substantial'}
+                  <span class="text-[10px] font-normal uppercase tracking-wider text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 rounded">Verdict: Substantial</span>
+                {/if}
               {:else if hasActiveSession(target.id)}
                 <span class="text-[10px] font-normal uppercase tracking-wider text-amber-300 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded">In Progress</span>
               {/if}
@@ -731,7 +958,12 @@
             </p>
             <p class="text-xs text-gray-500 mt-1">{selectedTarget.challenges?.description}</p>
           </div>
-          <button onclick={clearChatHistory} class="px-2.5 py-1 rounded border border-white/20 hover:border-white/40 text-xs text-gray-300 hover:text-white transition-colors" title="Resets the LLM conversation only. Server still counts prior attempts for bonus.">
+          <button
+            onclick={clearChatHistory}
+            disabled={attackLocked}
+            class="px-2.5 py-1 rounded border border-white/20 hover:border-white/40 text-xs text-gray-300 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-white/20"
+            title={attackLocked ? 'Attack finalized. Use Attack Again to start a new attempt.' : 'Resets the LLM conversation only. Server still counts prior attempts for bonus.'}
+          >
             Clear Chat
           </button>
         </div>
@@ -779,8 +1011,11 @@
               {@const verdictColor = judgeVerdict === 'full' || judgeVerdict === 'substantial' ? 'green' : judgeVerdict === 'partial' ? 'amber' : judgeVerdict === 'structural' ? 'amber' : 'red'}
               <div class="p-4 rounded-xl border bg-{verdictColor}-500/10 border-{verdictColor}-500/50 text-{verdictColor}-400">
                 <div class="font-black text-lg mb-2">⚖️ JUDGE VERDICT: {judgeVerdict.toUpperCase()} (×{attackResult.coefficient ?? 0})</div>
+                {#if attackResult.resolved_by_admin}
+                  <div class="inline-block text-[10px] uppercase tracking-widest font-bold mb-2 px-2 py-0.5 rounded border border-white/20 bg-white/5 text-white">Admin Resolved</div>
+                {/if}
                 {#if attackResult.judge_reason}
-                  <div class="text-sm opacity-90 font-medium">{attackResult.judge_reason}</div>
+                  <div class="text-sm opacity-90 font-medium whitespace-pre-wrap">{attackResult.judge_reason}</div>
                 {/if}
                 {#if isRealTier && typeof attackResult.stolen_coins === 'number'}
                   <div class="mt-3 px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-xs font-mono text-gray-200">
@@ -791,6 +1026,18 @@
                     {/if}
                     {#if typeof attackResult.elegance_factor === 'number'}· elegance {Math.round(attackResult.elegance_factor * 100)}%{/if}
                     {#if typeof attackResult.turn_count === 'number'}· {attackResult.turn_count} {attackResult.turn_count === 1 ? 'turn' : 'turns'}{/if}
+                  </div>
+                {/if}
+                {#if canAttackAgain}
+                  <div class="mt-4">
+                    <button
+                      type="button"
+                      onclick={attackAgain}
+                      class="px-4 py-2 rounded-lg border border-white/30 bg-white/10 hover:bg-white/20 text-white font-bold uppercase text-sm tracking-wider transition-colors"
+                    >
+                      ↻ Attack Again
+                    </button>
+                    <span class="ml-3 text-xs text-gray-400">Clears the chat and resets your bonus clock. Judge verdict stands.</span>
                   </div>
                 {/if}
               </div>
@@ -880,7 +1127,7 @@
               {/each}
             </div>
           {/if}
-          <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-28 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm resize-y" placeholder="> Type your attack prompt..."></textarea>
+          <textarea bind:value={promptInput} onkeydown={handlePromptKeydown} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-28 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm resize-y" placeholder="> Type your attack prompt... (Enter to send · Shift+Enter for newline)"></textarea>
           <!-- Compact row: file attach button + file chips + send prompt -->
           <div class="flex items-center gap-2 flex-wrap">
             <label class="shrink-0 cursor-pointer px-3 py-2 rounded-lg border border-white/15 bg-white/5 text-xs text-gray-200 hover:bg-white/10 transition-colors font-medium" title="Attach text files (max {MAX_UPLOAD_MB} MB total)">
@@ -903,11 +1150,11 @@
             {:else}
               <span class="text-[11px] text-gray-500 flex-1">Text only · {MAX_UPLOAD_MB} MB max</span>
             {/if}
-            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim() || !!attachmentError || selectedTargetCompromised} class="shrink-0 bg-red-600 hover:bg-red-500 text-white px-6 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
+            <button onclick={sendPrompt} disabled={chatLoading || !promptInput.trim() || !!attachmentError || attackLocked} class="shrink-0 bg-red-600 hover:bg-red-500 text-white px-6 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
               {chatLoading ? 'SENDING...' : 'Send Prompt'}
             </button>
             {#if selectedTarget?.challenges?.type === 'judge'}
-              <button onclick={endAttack} disabled={chatLoading || messages.filter((m) => m.role === 'user').length === 0 || selectedTargetCompromised} class="shrink-0 border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 px-4 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm" title="Commit this transcript to the judge. Coins settle on verdict or go to escrow.">
+              <button onclick={endAttack} disabled={chatLoading || messages.filter((m) => m.role === 'user').length === 0 || attackLocked} class="shrink-0 border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 px-4 py-2.5 rounded-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm" title="Commit this transcript to the judge. Coins settle on verdict or go to escrow.">
                 {chatLoading ? 'JUDGING...' : '⚖️ End Attack'}
               </button>
             {/if}
@@ -918,8 +1165,8 @@
 
           {#if selectedTarget?.challenges?.type === 'secret-key'}
             <div class="flex gap-3 pt-2 border-t border-white/10">
-              <input bind:value={secretKeyGuess} disabled={selectedTargetCompromised} class="flex-1 bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none placeholder:text-gray-600 font-mono text-sm disabled:opacity-50" placeholder="Secret key guess..." />
-              <button onclick={submitSecretGuess} disabled={chatLoading || !secretKeyGuess.trim() || selectedTargetCompromised} class="border border-red-500/40 hover:bg-red-500/10 text-red-400 px-4 py-3 rounded-xl font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
+              <input bind:value={secretKeyGuess} disabled={attackLocked} class="flex-1 bg-black/60 border border-white/10 rounded-xl p-3 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none placeholder:text-gray-600 font-mono text-sm disabled:opacity-50" placeholder="Secret key guess..." />
+              <button onclick={submitSecretGuess} disabled={chatLoading || !secretKeyGuess.trim() || attackLocked} class="border border-red-500/40 hover:bg-red-500/10 text-red-400 px-4 py-3 rounded-xl font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-all uppercase text-sm">
                 {chatLoading ? '...' : 'Guess'}
               </button>
             </div>

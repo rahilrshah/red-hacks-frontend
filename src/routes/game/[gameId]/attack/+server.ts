@@ -905,23 +905,28 @@ export const POST: RequestHandler = async ({ params, request }) => {
           defender_eliminated: defenderEliminated
         };
 
-        await supabaseAdmin.from('attacks').insert({
-          defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
-          challenge_id: effectiveChallengeId,
-          attacker_user_id: attackerUserId,
-          attacker_team_id: attackerTeamId,
-          is_successful: false, // coins haven't moved to attacker yet
-          log: attackLog,
-          judge_verdict: 'escalate',
-          judge_coefficient: null,
-          judge_reason: escalateReason,
-          escalation_status: 'pending',
-          escrow_amount: heldAmount,
-          escrow_snapshot: escrowSnapshot
-        });
+        const { data: inserted } = await supabaseAdmin
+          .from('attacks')
+          .insert({
+            defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+            challenge_id: effectiveChallengeId,
+            attacker_user_id: attackerUserId,
+            attacker_team_id: attackerTeamId,
+            is_successful: false, // coins haven't moved to attacker yet
+            log: attackLog,
+            judge_verdict: 'escalate',
+            judge_coefficient: null,
+            judge_reason: escalateReason,
+            escalation_status: 'pending',
+            escrow_amount: heldAmount,
+            escrow_snapshot: escrowSnapshot
+          })
+          .select('id')
+          .single();
 
         return json({
           success: false,
+          attack_id: inserted?.id ?? null,
           escalated: true,
           message: 'Attack submitted for admin review. Coins held in escrow pending decision.',
           escrow_amount: heldAmount,
@@ -980,24 +985,35 @@ export const POST: RequestHandler = async ({ params, request }) => {
         defender_eliminated: defenderEliminated
       };
 
-      const cooldownStarts = coefficient > 0;
-      await supabaseAdmin.from('attacks').insert({
-        defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
-        challenge_id: effectiveChallengeId,
-        attacker_user_id: attackerUserId,
-        attacker_team_id: attackerTeamId,
-        is_successful: cooldownStarts,
-        log: attackLog,
-        judge_verdict: judgeResult.verdict,
-        judge_coefficient: coefficient,
-        judge_reason: judgeResult.reason,
-        escalation_status: null,
-        escrow_amount: null,
-        escrow_snapshot: escrowSnapshot
-      });
+      // Every real verdict is a terminal "attempt concluded" event. Marking
+      // is_successful=true advances the bonus window (see refreshServerTurnCount
+      // and computeEleganceBonus) so the attacker's next attempt on this
+      // defender starts fresh. 'none' gets this too — the attacker is entitled
+      // to a clean slate after the judge rules, even without a payout. The
+      // "already compromised" re-attack block keys off judge_verdict='full', so
+      // flipping is_successful on non-full verdicts doesn't lock them out.
+      const { data: insertedVerdictRow } = await supabaseAdmin
+        .from('attacks')
+        .insert({
+          defended_challenge_id: targetDetails?.id ?? defendedChallengeId,
+          challenge_id: effectiveChallengeId,
+          attacker_user_id: attackerUserId,
+          attacker_team_id: attackerTeamId,
+          is_successful: true,
+          log: attackLog,
+          judge_verdict: judgeResult.verdict,
+          judge_coefficient: coefficient,
+          judge_reason: judgeResult.reason,
+          escalation_status: null,
+          escrow_amount: null,
+          escrow_snapshot: escrowSnapshot
+        })
+        .select('id')
+        .single();
 
       return json({
-        success: cooldownStarts,
+        success: coefficient > 0,
+        attack_id: insertedVerdictRow?.id ?? null,
         verdict: judgeResult.verdict,
         coefficient,
         judge_reason: judgeResult.reason,

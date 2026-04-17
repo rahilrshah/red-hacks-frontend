@@ -124,7 +124,7 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
       supabase.from('teams').select('id, name').eq('game_id', gameId),
       supabase
         .from('attacks')
-        .select('id, is_successful, log, created_at, attacker_team_id, defended_challenge:defended_challenges!inner(id, team_id, challenge_id)')
+        .select('id, is_successful, log, created_at, attacker_team_id, judge_verdict, judge_coefficient, escalation_status, defended_challenge:defended_challenges!inner(id, team_id, challenge_id)')
         .eq('defended_challenge.team_id', teamId)
         .eq('defended_challenge.challenge_id', challengeId)
         .order('created_at', { ascending: false }),
@@ -297,6 +297,107 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
       return dateText;
     }
   }
+
+  // Group individual attack rows into "attempts". An attempt = the run of
+  // rows from one attacker team leading up to (and including) a finalization
+  // row. Finalization = is_successful=true, OR a judge end-attack row
+  // (anything with judge_verdict set, including 'none' / 'escalate'). If the
+  // last rows for a team have no finalization they're shown as "In Progress".
+  type Attempt = {
+    key: string;
+    attackerTeamId: string;
+    attackerTeamName: string;
+    rows: any[];
+    final: any | null;
+    startedAt: string;
+    endedAt: string;
+  };
+
+  let expandedAttempts = $state<Record<string, boolean>>({});
+
+  function isFinalizationRow(row: any): boolean {
+    if (row.judge_verdict) return true;
+    if (row.escalation_status) return true;
+    if (row.is_successful === true) return true;
+    return false;
+  }
+
+  let attemptsAgainstUs = $derived.by<Attempt[]>(() => {
+    const sorted = [...attacksAgainstUs].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+    const perTeamBuffers = new Map<string, any[]>();
+    const attempts: Attempt[] = [];
+
+    const closeAttempt = (teamId: string, finalRow: any | null) => {
+      const buffer = perTeamBuffers.get(teamId);
+      if (!buffer || buffer.length === 0) return;
+      attempts.push({
+        key: `${teamId}:${buffer[0].id}`,
+        attackerTeamId: teamId,
+        attackerTeamName: buffer[buffer.length - 1].attacker_team_name ?? 'Unknown team',
+        rows: buffer,
+        final: finalRow,
+        startedAt: buffer[0].created_at,
+        endedAt: buffer[buffer.length - 1].created_at
+      });
+      perTeamBuffers.set(teamId, []);
+    };
+
+    for (const row of sorted) {
+      const teamId = row.attacker_team_id ?? 'unknown';
+      if (!perTeamBuffers.has(teamId)) perTeamBuffers.set(teamId, []);
+      perTeamBuffers.get(teamId)!.push(row);
+      if (isFinalizationRow(row)) {
+        closeAttempt(teamId, row);
+      }
+    }
+
+    // Flush remaining in-progress buffers.
+    for (const teamId of perTeamBuffers.keys()) {
+      closeAttempt(teamId, null);
+    }
+
+    // Newest attempt first.
+    attempts.sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    );
+    return attempts;
+  });
+
+  function attemptOutcome(attempt: Attempt): { label: string; color: string } {
+    if (!attempt.final) return { label: 'In Progress', color: 'text-amber-300' };
+    if (attempt.final.judge_verdict) {
+      const v = String(attempt.final.judge_verdict);
+      if (v === 'full') return { label: 'Judge: Full Compromise', color: 'text-red-400' };
+      if (v === 'substantial') return { label: 'Judge: Substantial', color: 'text-red-300' };
+      if (v === 'partial') return { label: 'Judge: Partial', color: 'text-amber-300' };
+      if (v === 'structural') return { label: 'Judge: Structural', color: 'text-amber-300' };
+      if (v === 'none') return { label: 'Judge: None (Defense Held)', color: 'text-emerald-400' };
+      if (v === 'escalate') return { label: 'Judge: Escalated (Review Pending)', color: 'text-amber-300' };
+      return { label: `Judge: ${v}`, color: 'text-amber-300' };
+    }
+    if (attempt.final.is_successful) return { label: 'Compromise Successful', color: 'text-red-400' };
+    return { label: 'Attack Failed', color: 'text-emerald-400' };
+  }
+
+  function toggleAttempt(key: string) {
+    expandedAttempts = { ...expandedAttempts, [key]: !expandedAttempts[key] };
+  }
+
+  function rowLabel(row: any, index: number, total: number): string {
+    if (row.log?.source === 'judge') return `End Attack (turn ${index + 1}/${total})`;
+    if (row.is_successful === true) return `Final turn (success) · turn ${index + 1}/${total}`;
+    return `Turn ${index + 1}/${total}`;
+  }
+
+  function rowAssistant(row: any): string | null {
+    const log = row.log;
+    if (!log || typeof log !== 'object') return null;
+    if (typeof log.assistant_message === 'string' && log.assistant_message.trim()) return log.assistant_message;
+    if (typeof log.backend_message === 'string' && log.backend_message.trim()) return log.backend_message;
+    return null;
+  }
 </script>
 
 <div class="p-8 max-w-7xl mx-auto space-y-8">
@@ -385,23 +486,56 @@ If uncertain, reply with a brief refusal and no sensitive details.`;
           <span class="text-xs text-gray-500">Filtered by {challenge.name || challenge.model_name}</span>
       </div>
 
-      {#if attacksAgainstUs.length === 0}
+      {#if attemptsAgainstUs.length === 0}
         <div class="p-6 text-gray-400">No attacks recorded for this challenge yet.</div>
       {:else}
         <div class="divide-y divide-white/5">
-          {#each attacksAgainstUs as attack}
-            <div class="p-5 space-y-2">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <div class="font-semibold {attack.is_successful ? 'text-red-400' : 'text-emerald-400'}">
-                  {attack.is_successful ? 'Compromise Successful' : 'Attack Failed'}
+          {#each attemptsAgainstUs as attempt (attempt.key)}
+            {@const outcome = attemptOutcome(attempt)}
+            {@const expanded = expandedAttempts[attempt.key] === true}
+            <div class="p-5 space-y-3">
+              <button
+                type="button"
+                class="w-full text-left flex flex-wrap items-center justify-between gap-2 hover:opacity-90 transition-opacity"
+                onclick={() => toggleAttempt(attempt.key)}
+              >
+                <div class="flex items-center gap-3">
+                  <span class="text-gray-400 text-sm w-4 inline-block">{expanded ? '▾' : '▸'}</span>
+                  <span class="font-semibold {outcome.color}">{outcome.label}</span>
+                  <span class="text-xs text-gray-500">· {attempt.rows.length} {attempt.rows.length === 1 ? 'message' : 'messages'}</span>
                 </div>
-                <div class="text-xs text-gray-500">{formatDate(attack.created_at)}</div>
-              </div>
-              <div class="text-sm text-gray-300">Attacker Team: {attack.attacker_team_name}</div>
-              <div class="text-xs text-gray-500 uppercase tracking-wider">Prompt used</div>
-              <div class="text-sm text-gray-200 bg-black/50 border border-white/10 rounded-lg p-3 font-mono whitespace-pre-wrap">
-                {promptPreview(attack.log)}
-              </div>
+                <div class="text-xs text-gray-500">{formatDate(attempt.startedAt)}{attempt.final ? ` → ${formatDate(attempt.endedAt)}` : ''}</div>
+              </button>
+              <div class="text-sm text-gray-300 pl-7">Attacker Team: {attempt.attackerTeamName}</div>
+              {#if expanded}
+                <div class="pl-7 space-y-3">
+                  {#each attempt.rows as row, index (row.id)}
+                    {@const assistantText = rowAssistant(row)}
+                    <div class="space-y-2 border-l-2 border-white/10 pl-4">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs text-gray-400 uppercase tracking-wider">{rowLabel(row, index, attempt.rows.length)}</span>
+                        <span class="text-xs text-gray-500">{formatDate(row.created_at)}</span>
+                      </div>
+                      <div>
+                        <div class="text-[11px] text-gray-500 uppercase tracking-wider mb-1">Attacker prompt</div>
+                        <div class="text-sm text-gray-200 bg-black/50 border border-white/10 rounded-lg p-3 font-mono whitespace-pre-wrap">{promptPreview(row.log)}</div>
+                      </div>
+                      {#if assistantText}
+                        <div>
+                          <div class="text-[11px] text-gray-500 uppercase tracking-wider mb-1">Model response</div>
+                          <div class="text-sm text-gray-200 bg-slate-900/60 border border-white/10 rounded-lg p-3 font-mono whitespace-pre-wrap">{assistantText}</div>
+                        </div>
+                      {/if}
+                      {#if row.judge_verdict && row.log?.judge_reason}
+                        <div>
+                          <div class="text-[11px] text-amber-400/80 uppercase tracking-wider mb-1">Judge reason</div>
+                          <div class="text-sm text-amber-200/90 bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 whitespace-pre-wrap">{row.log.judge_reason}</div>
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>

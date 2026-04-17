@@ -5,3 +5,5 @@ pydantic==2.5.0
 python-dotenv==1.0.0
 torch
 transformers
+pytest>=7.4
+pytest-asyncio>=0.21

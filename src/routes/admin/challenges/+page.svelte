@@ -1,6 +1,7 @@
 <script lang="ts">
   import { DEFAULT_JUDGE_MODEL, DEFAULT_TIER_DESCRIPTIONS, type JudgeRubric, type JudgeTier } from '$lib/judge';
   import { supabase } from '$lib/supabaseClient';
+  import { isSteeringCapable } from '$lib/steering/types';
   import { onMount } from 'svelte';
 
   // UI state
@@ -274,7 +275,7 @@
             target_tool_name: type === 'tool-calling' ? target_tool_name || null : null,
             defense_reward_coins,
             attack_steal_coins,
-            interp_arg_id: model_name === 'llama-interp-server' ? (interp_arg_id || null) : null,
+            interp_arg_id: isSteeringCapable(model_name) ? (interp_arg_id || null) : null,
             judge_rubric: type === 'judge' ? buildJudgeRubric() : null,
             judge_model: type === 'judge' ? (judge_model.trim() || null) : null
           })
@@ -545,7 +546,7 @@
         </div>
       {/if}
 
-      {#if model_name === 'llama-interp-server'}
+      {#if isSteeringCapable(model_name)}
         <div class="space-y-2 col-span-2">
           <p class="text-sm font-medium text-gray-300">Interp Args (Configuration)</p>
           <select bind:value={interp_arg_id} class="w-full bg-black/40 border border-white/10 rounded-md p-2.5 text-white focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all">

@@ -11,6 +11,7 @@ import {
   type JudgeRubric,
   type JudgeVerdict
 } from '$lib/judge';
+import { normalizeAttackerSteering, type AttackerSteeringNormalized } from '$lib/steering/server';
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient } from '@supabase/supabase-js';
 
@@ -49,6 +50,11 @@ type AttackRequestBody = {
   // judge-type challenges: set true on the End Attack click to trigger
   // the judge LLM evaluation over the full transcript.
   end_attack?: boolean;
+  // Optional attacker-steering: nudge the defender's model in a direction
+  // the attacker has access to. Vector ownership is enforced by RLS under
+  // the attacker's JWT. Coefficient is clamped to the vector's own
+  // [min_coefficient, max_coefficient] band server-side (V4.3).
+  attacker_steering?: { vector_id?: unknown; coefficient?: unknown } | null;
 };
 
 type AttachmentSummary = {
@@ -190,7 +196,13 @@ async function parseAttackRequestBody(request: Request): Promise<AttackRequestBo
       guess: getString('guess') || undefined,
       messages: safeJsonParse(getString('messages'), [] as Array<{ role?: string; content?: string }>),
       challenge: safeJsonParse(getString('challenge'), null),
-      attachments
+      attachments,
+      // Multipart callers (attachment uploads) serialize the steering
+      // nested object as a JSON string — mirror the JSON path.
+      attacker_steering: safeJsonParse(
+        getString('attacker_steering'),
+        null as { vector_id?: unknown; coefficient?: unknown } | null
+      )
     };
   }
 
@@ -354,7 +366,13 @@ async function parseResponseBody(response: Response) {
   }
 }
 
-function buildAttackRequestPayload(body: AttackRequestBody, targetDetails: any, challengeId: string, targetSecretKey: string | null) {
+function buildAttackRequestPayload(
+  body: AttackRequestBody,
+  targetDetails: any,
+  challengeId: string,
+  targetSecretKey: string | null,
+  attackerSteering: AttackerSteeringNormalized | null
+) {
   const attachmentSummaries = normalizeAttachmentSummaries(body.attachments);
   const mergedPrompt = mergePromptWithAttachments(body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || '', attachmentSummaries);
   const normalizedMessages = normalizeMessages(body.messages);
@@ -374,6 +392,14 @@ function buildAttackRequestPayload(body: AttackRequestBody, targetDetails: any, 
     })),
     challenge: buildResolvedChallengePayload(targetDetails, challengeId, targetSecretKey)
   };
+
+  // Only include the steering handle when a real vector was selected and
+  // range-checked. The edge function will strip it for non-steering
+  // models (V4.4), so forwarding it unconditionally is safe — but keeping
+  // the key absent in the "no steering" case keeps logs/diffs cleaner.
+  if (attackerSteering) {
+    payload.attacker_steering = attackerSteering;
+  }
 
   if (targetDetails?.challenge_mode === 'pve') {
     payload.challenge_id = challengeId;
@@ -1030,7 +1056,90 @@ export const POST: RequestHandler = async ({ params, request }) => {
       });
     }
 
-    const outboundPayload = buildAttackRequestPayload(body, targetDetails, effectiveChallengeId, targetSecretKey);
+    // ---------- Attacker-steering resolution (Phase 4) ----------
+    // Phase 1: get the vector row + its coefficient bounds using a client
+    // authenticated as the attacker so RLS fires. If the caller requested a
+    // private vector they don't own, Supabase returns no row → we 403 here.
+    // V4.5 checks this round-trip.
+    // Phase 2: bounds-clamp with the persisted [min,max] (V4.3). We do NOT
+    // clamp silently — an out-of-range submit becomes a 422 so the client
+    // can fix its UI instead of the user getting surprising attenuation.
+    //
+    // The edge function is responsible for dropping the field for non-
+    // steering models (V4.4). We still let the request reach the edge
+    // function even for non-steering targets so we don't silently mask a
+    // stale client that's sending the field — the edge function drops it
+    // and returns a successful response, preserving backwards compat.
+    let resolvedAttackerSteering: AttackerSteeringNormalized | null = null;
+    if (body.attacker_steering !== undefined && body.attacker_steering !== null) {
+      const rawRef = body.attacker_steering;
+      const requestedVectorId = typeof rawRef?.vector_id === 'string' ? rawRef.vector_id.trim() : '';
+      if (!requestedVectorId) {
+        return json({ success: false, error: 'attacker_steering.vector_id is required.' }, { status: 400 });
+      }
+
+      if (!supabaseAnonKey) {
+        return json(
+          { success: false, error: 'Server is missing the Supabase anon key required for RLS checks.' },
+          { status: 500 }
+        );
+      }
+
+      // User-scoped client so `steering_vectors` RLS can filter.
+      // Anything not visible to the caller (i.e. someone else's private
+      // vector) comes back as zero rows, which we treat as a 403.
+      const supabaseAsUser = createClient(supabaseUrl, supabaseAnonKey, {
+        global: { headers: { Authorization: `Bearer ${accessToken}` } },
+        auth: { persistSession: false, autoRefreshToken: false }
+      });
+
+      const { data: vectorRow, error: vectorError } = await supabaseAsUser
+        .from('steering_vectors')
+        .select('id, model_name, min_coefficient, max_coefficient, is_active')
+        .eq('id', requestedVectorId)
+        .maybeSingle();
+
+      if (vectorError) {
+        return json(
+          { success: false, error: `Could not load the requested steering vector: ${vectorError.message}` },
+          { status: 500 }
+        );
+      }
+
+      if (!vectorRow) {
+        return json(
+          { success: false, error: 'You do not have access to that steering vector.' },
+          { status: 403 }
+        );
+      }
+
+      if (!vectorRow.is_active) {
+        return json(
+          { success: false, error: 'That steering vector has been deactivated.' },
+          { status: 410 }
+        );
+      }
+
+      const normalizeResult = normalizeAttackerSteering(rawRef, {
+        min_coefficient: vectorRow.min_coefficient,
+        max_coefficient: vectorRow.max_coefficient
+      });
+      if (!normalizeResult.ok) {
+        return json(
+          { success: false, error: normalizeResult.error },
+          { status: normalizeResult.status }
+        );
+      }
+      resolvedAttackerSteering = normalizeResult.steering;
+    }
+
+    const outboundPayload = buildAttackRequestPayload(
+      body,
+      targetDetails,
+      effectiveChallengeId,
+      targetSecretKey,
+      resolvedAttackerSteering
+    );
     const hasDirectBackend = typeof targetDetails?.challenges?.challenge_url === 'string' && targetDetails.challenges.challenge_url.trim().length > 0;
 
     const outboundHeaders: Record<string, string> = {
@@ -1240,7 +1349,15 @@ export const POST: RequestHandler = async ({ params, request }) => {
       const stolenCoins = Math.max(0, asFiniteNumber(parsedObject?.stolen_coins) ?? 0);
       const latestPrompt = body.prompt?.trim() || normalizeMessages(body.messages).at(-1)?.content || '';
 
-      const attackLog = {
+      // Phase 5 (V5.2 / V5.4): direct-backend path — preserve the
+      // interp-backend's `steering` block in the attack log. Omit the key
+      // entirely for non-interp/direct responses that didn't return one.
+      const steeringFromDirect =
+        parsedObject?.steering && typeof parsedObject.steering === 'object'
+          ? parsedObject.steering
+          : null;
+
+      const attackLog: Record<string, unknown> = {
         source: 'direct-backend',
         backend_status: response.status,
         backend_url: targetUrl,
@@ -1261,6 +1378,9 @@ export const POST: RequestHandler = async ({ params, request }) => {
         attacker_coins_after: asFiniteNumber(parsedObject?.attacker_coins_after),
         defender_eliminated: parsedObject?.defender_eliminated === true
       };
+      if (steeringFromDirect) {
+        attackLog.steering = steeringFromDirect;
+      }
 
       const { error: attackInsertError } = await supabaseAdmin.from('attacks').insert({
         defended_challenge_id: isPveTarget ? null : (targetDetails?.id ?? defendedChallengeId),

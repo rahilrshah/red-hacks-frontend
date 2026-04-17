@@ -16,6 +16,8 @@
   import { calculateAttackBonus, SOFT_CHAR_CAP, SOFT_TURN_CAP } from '$lib/bonus';
   import GameSectionNav from '$lib/components/GameSectionNav.svelte';
   import { isGameActive, loadRoundChallengeIds, loadRoundRuntimeContext, resolveRoundType } from '$lib/gameplay';
+  import { STEERING_ATTACK_COPY } from '$lib/steering/copy';
+  import { isSteeringCapable, type SteeringVector } from '$lib/steering/types';
   import { supabase } from '$lib/supabaseClient';
   import { onMount } from 'svelte';
 
@@ -42,6 +44,28 @@
 
   let attackMode = $derived(resolveRoundType(roundInfo));
   const chatStorageKey = $derived(`attack-chat:${gameId}:${attackMode}:${defendedChallengeId}`);
+
+  // ---------- Attacker-steering panel state ----------
+  // The panel is only rendered when the target's model is steering-capable
+  // (V4.1). Loaded lazily via /api/steering-vectors so we don't re-fetch on
+  // every keystroke. The selected vector's `[min_coefficient, max_coefficient]`
+  // bounds drive the slider min/max (V4.3 — client-side half of the clamp).
+  let steeringVectors = $state<SteeringVector[]>([]);
+  let steeringLoading = $state(false);
+  let steeringLoadError = $state<string | null>(null);
+  let steeringLoaded = $state(false);
+  let selectedVectorId = $state<string>('');
+  let steeringCoefficient = $state<number>(1);
+
+  let targetModelName = $derived(target?.challenges?.model_name ?? null);
+  let steeringCapable = $derived(isSteeringCapable(targetModelName));
+  let selectedVector = $derived(
+    steeringVectors.find((v) => v.id === selectedVectorId) ?? null
+  );
+  let coefficientBounds = $derived({
+    min: selectedVector?.min_coefficient ?? -4,
+    max: selectedVector?.max_coefficient ?? 4
+  });
 
   // Client-side preview of the potential reward for the *next* attempt.
   // Counts the user turns in the local chat + the currently-drafted prompt.
@@ -99,6 +123,54 @@
     if (!roundInfo) return;
     loadChatHistory();
   });
+
+  // Fetch the attacker's available steering vectors the first time we
+  // determine the target is steering-capable. We filter to compatible
+  // models server-side to avoid offering vectors built on a different
+  // backbone — the Pydantic contract rejects a cross-model pairing anyway.
+  $effect(() => {
+    if (!steeringCapable || steeringLoaded || steeringLoading) return;
+    if (!targetModelName) return;
+    void loadSteeringVectors(targetModelName);
+  });
+
+  // Clamp the coefficient whenever the user switches to a different vector
+  // so the slider state never drifts outside the persisted bounds.
+  $effect(() => {
+    if (!selectedVector) return;
+    const { min_coefficient, max_coefficient } = selectedVector;
+    if (steeringCoefficient < min_coefficient) steeringCoefficient = min_coefficient;
+    if (steeringCoefficient > max_coefficient) steeringCoefficient = max_coefficient;
+  });
+
+  async function loadSteeringVectors(modelName: string) {
+    steeringLoading = true;
+    steeringLoadError = null;
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        steeringLoadError = 'Sign in to use steering vectors.';
+        return;
+      }
+      const qs = new URLSearchParams({ model_name: modelName, active_only: '1' });
+      const response = await fetch(`/api/steering-vectors?${qs.toString()}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        steeringLoadError = text || `Failed to load steering vectors (${response.status}).`;
+        return;
+      }
+      const parsed = await response.json();
+      steeringVectors = Array.isArray(parsed?.vectors) ? parsed.vectors : [];
+      steeringLoaded = true;
+    } catch (err: any) {
+      steeringLoadError = err?.message || 'Failed to load steering vectors.';
+    } finally {
+      steeringLoading = false;
+    }
+  }
 
   onMount(() => {
     void (async () => {
@@ -372,6 +444,19 @@
       payload.defended_challenge_id = defendedChallengeId;
     }
 
+    // V4.2 — only attach when both capable and a vector is selected.
+    // If the target is not steering-capable, the panel is hidden and
+    // selectedVectorId is the empty string, so this branch is skipped.
+    if (steeringCapable && selectedVector) {
+      const min = selectedVector.min_coefficient;
+      const max = selectedVector.max_coefficient;
+      const clamped = Math.max(min, Math.min(max, steeringCoefficient));
+      payload.attacker_steering = {
+        vector_id: selectedVector.id,
+        coefficient: clamped
+      };
+    }
+
     return payload;
   }
 
@@ -591,6 +676,76 @@
             Bonus decays past {SOFT_TURN_CAP} turns or {SOFT_CHAR_CAP.toLocaleString()} total chars.
             Approximate — server decides the final amount on success.
           </p>
+
+          {#if steeringCapable}
+            <div class="border border-fuchsia-500/30 bg-fuchsia-500/5 rounded-xl p-4 space-y-3" data-testid="attacker-steering-panel">
+              <div>
+                <p class="text-sm font-semibold text-fuchsia-200 uppercase tracking-wider">{STEERING_ATTACK_COPY.heading}</p>
+                <p class="text-[11px] text-fuchsia-200/70 mt-1">{STEERING_ATTACK_COPY.body}</p>
+              </div>
+
+              {#if steeringLoading}
+                <p class="text-xs text-fuchsia-200/70">{STEERING_ATTACK_COPY.loading}</p>
+              {:else if steeringLoadError}
+                <p class="text-xs text-red-300">{STEERING_ATTACK_COPY.errorPrefix}{steeringLoadError}</p>
+              {:else if steeringVectors.length === 0}
+                <p class="text-xs text-fuchsia-200/70">{STEERING_ATTACK_COPY.empty}</p>
+                <a
+                  href="/steering/vectors/new"
+                  class="inline-block text-xs text-fuchsia-300 underline underline-offset-2 hover:text-fuchsia-200"
+                  >Create a steering vector →</a
+                >
+              {:else}
+                <label class="block text-xs text-fuchsia-200/80">
+                  <span class="block mb-1 uppercase tracking-wider">Vector</span>
+                  <select
+                    bind:value={selectedVectorId}
+                    class="w-full bg-black/60 border border-fuchsia-500/30 rounded-md p-2 text-white focus:ring-2 focus:ring-fuchsia-500/50 outline-none text-sm"
+                    data-testid="attacker-steering-vector-select"
+                  >
+                    <option value="">{STEERING_ATTACK_COPY.noneOption}</option>
+                    {#each steeringVectors as vector (vector.id)}
+                      <option value={vector.id}
+                        >{vector.name} · {vector.visibility === 'public' ? 'public' : 'private'}</option
+                      >
+                    {/each}
+                  </select>
+                </label>
+
+                {#if selectedVector}
+                  <label class="block text-xs text-fuchsia-200/80">
+                    <span class="block mb-1 uppercase tracking-wider"
+                      >{STEERING_ATTACK_COPY.coefficientLabel(coefficientBounds.min, coefficientBounds.max)}</span
+                    >
+                    <div class="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min={coefficientBounds.min}
+                        max={coefficientBounds.max}
+                        step="0.1"
+                        bind:value={steeringCoefficient}
+                        class="flex-1 accent-fuchsia-500"
+                        data-testid="attacker-steering-coefficient-slider"
+                      />
+                      <input
+                        type="number"
+                        min={coefficientBounds.min}
+                        max={coefficientBounds.max}
+                        step="0.1"
+                        bind:value={steeringCoefficient}
+                        class="w-24 bg-black/60 border border-fuchsia-500/30 rounded-md p-2 text-white text-sm font-mono"
+                        data-testid="attacker-steering-coefficient-input"
+                      />
+                    </div>
+                    <p class="text-[10px] text-fuchsia-200/60 mt-1">
+                      Positive pushes toward the vector's positive examples; negative inverts the direction.
+                    </p>
+                  </label>
+                {/if}
+              {/if}
+            </div>
+          {/if}
+
           <textarea bind:value={promptInput} class="w-full bg-black/60 border border-white/10 rounded-xl p-4 text-white h-32 focus:ring-2 focus:ring-red-500/50 focus:border-red-500 outline-none transition-all placeholder:text-gray-600 font-mono text-sm leading-relaxed" placeholder="> Continue attack conversation..."></textarea>
           <button onclick={sendPrompt} disabled={loading || !promptInput.trim()} class="bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-xl font-bold disabled:opacity-50 transition-all w-full uppercase">{loading ? 'SENDING...' : 'Send Prompt'}</button>
         </div>
@@ -625,6 +780,31 @@
             {:else if isSuccess && typeof attackResult.base_coins === 'number'}
               <div class="mt-3 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-gray-300 text-xs font-mono">
                 Base reward: {attackResult.base_coins} coins (elegance exhausted, no bonus)
+              </div>
+            {/if}
+            {#if attackResult.steering && (attackResult.steering.defender || attackResult.steering.attacker)}
+              {@const steeringBlock = attackResult.steering}
+              <div
+                class="mt-3 px-3 py-2 rounded-lg bg-fuchsia-500/10 border border-fuchsia-500/30 text-xs font-mono text-fuchsia-200 space-y-1"
+                data-testid="steering-result-block"
+              >
+                {#if steeringBlock.defender}
+                  {@const d = steeringBlock.defender}
+                  <!-- §5.5 format: "Defender steering: `name` @ 3.00 (layers 8–11)" -->
+                  <div data-testid="steering-defender-line">
+                    Defender steering: <code class="text-fuchsia-100">{d.vector_name ?? d.vector_id}</code>
+                    @ {Number(d.coefficient).toFixed(2)}
+                    (layers {Array.isArray(d.target_layers) ? d.target_layers.join(',') : '?'})
+                  </div>
+                {/if}
+                {#if steeringBlock.attacker}
+                  {@const a = steeringBlock.attacker}
+                  <div data-testid="steering-attacker-line">
+                    Your steering: <code class="text-fuchsia-100">{a.vector_name ?? a.vector_id}</code>
+                    @ {Number(a.coefficient).toFixed(2)}
+                    (layers {Array.isArray(a.target_layers) ? a.target_layers.join(',') : '?'})
+                  </div>
+                {/if}
               </div>
             {/if}
             {#if attackResult.log}

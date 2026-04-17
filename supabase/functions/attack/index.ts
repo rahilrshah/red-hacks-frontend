@@ -370,7 +370,15 @@ Deno.serve(async (req) => {
       prompt,
       guess,
       messages,
-      attachments
+      attachments,
+      // Attacker-steering handle resolved by the SvelteKit route. When
+      // present, it is `{vector_id, coefficient}` — see src/routes/game/
+      // [gameId]/attack/+server.ts for the RLS + range check. We forward
+      // it to the interp backend only when the target model is steering-
+      // capable (isLlamaInterp); other backends (OpenRouter) don't know
+      // about interp_args / attacker_steering, so we drop it there.
+      // V4.4: silently dropped for non-interp.
+      attacker_steering
     } = await req.json()
 
     if (!defended_challenge_id && !challenge_id) {
@@ -786,6 +794,11 @@ Deno.serve(async (req) => {
     let openAiResponse = 'No response received'
     let calledTools: string[] = []
     let isSuccessful = false
+    // Phase 5: top-level `steering` block from the interp backend. Absent
+    // for OpenRouter-backed models (V5.4). For interp responses this is
+    // `{enabled, defender, attacker}` where defender/attacker are either a
+    // descriptor object or null.
+    let steeringMetadata: Record<string, unknown> | null = null
 
     if (finalUserMessages.length > 0) {
       const modelName = challenges.model_name || 'openai/gpt-4o-mini';
@@ -829,6 +842,23 @@ Deno.serve(async (req) => {
 
       if (isLlamaInterp && challenges.interp_args?.configuration) {
           payload.interp_args = challenges.interp_args.configuration;
+      }
+
+      // V4.4: forward attacker-steering only when the target runs the
+      // steering-capable backend. Other providers (OpenRouter, etc.) don't
+      // understand this field and would silently ignore or reject it —
+      // dropping it here keeps the surface tight.
+      if (isLlamaInterp && attacker_steering && typeof attacker_steering === 'object') {
+        const steeringVectorId = typeof (attacker_steering as any).vector_id === 'string'
+          ? (attacker_steering as any).vector_id.trim()
+          : ''
+        const steeringCoefficient = Number((attacker_steering as any).coefficient)
+        if (steeringVectorId && Number.isFinite(steeringCoefficient)) {
+          payload.attacker_steering = {
+            vector_id: steeringVectorId,
+            coefficient: steeringCoefficient
+          }
+        }
       }
       
       const openRouterKey = Deno.env.get('OPENROUTER_KEY') ?? '';
@@ -883,6 +913,14 @@ Deno.serve(async (req) => {
 
         if (challenges.type === 'tool-calling' && challenges.target_tool_name) {
           isSuccessful = calledTools.includes(challenges.target_tool_name)
+        }
+
+        // V5.4: only capture steering metadata when the response came from
+        // the interp backend. OpenRouter doesn't emit this key, so leaving
+        // it null ensures the response + log omit the field entirely for
+        // non-interp targets.
+        if (isLlamaInterp && data && typeof data.steering === 'object' && data.steering !== null) {
+          steeringMetadata = data.steering as Record<string, unknown>
         }
       } catch (err: any) {
         openAiResponse = `[Error executing LLM model ${modelName}]: ${err.message}`;
@@ -946,7 +984,10 @@ Deno.serve(async (req) => {
 
     const totalStolen = baseCoinsOut + (bonusOutcome?.bonus ?? 0)
 
-    const attackLog = {
+    // Phase 5: fold the interp backend's steering block into the log
+    // (V5.2). For OpenRouter-backed rows, steeringMetadata is null and
+    // the key is omitted entirely (V5.4).
+    const attackLog: Record<string, unknown> = {
       ...attackLogBase,
       latest_prompt: latestPrompt,
       assistant_message: openAiResponse,
@@ -964,6 +1005,9 @@ Deno.serve(async (req) => {
       attacker_coins_after: attackerCoinsAfter,
       defender_eliminated: transferResult?.defender_eliminated ?? false
     }
+    if (steeringMetadata) {
+      attackLog.steering = steeringMetadata
+    }
 
     await supabaseAdmin.from('attacks').insert({
           defended_challenge_id,
@@ -976,7 +1020,7 @@ Deno.serve(async (req) => {
 
     await uploadAttackTranscript(supabaseAdmin, defended_challenge_id, attackLog)
 
-    return new Response(JSON.stringify({
+    const responseBody: Record<string, unknown> = {
       success: isSuccessful,
       message: isSuccessful
         ? isPveTarget
@@ -997,7 +1041,12 @@ Deno.serve(async (req) => {
       defender_coins_after: transferResult?.defender_coins ?? null,
       defender_eliminated: transferResult?.defender_eliminated ?? false,
       challenge_id: isPveTarget ? challenge_id : null
-    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+    // V5.4: key absent for non-interp targets.
+    if (steeringMetadata) {
+      responseBody.steering = steeringMetadata
+    }
+    return new Response(JSON.stringify(responseBody), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     
   } catch (error: any) {
     return new Response(JSON.stringify({ error: error.message }), {
